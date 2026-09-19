@@ -4,13 +4,15 @@
 #[cfg(target_os = "linux")]
 mod bt;
 #[cfg(target_os = "linux")]
+mod install;
+#[cfg(target_os = "linux")]
+mod ledd;
+#[cfg(target_os = "linux")]
 mod iapd;
 #[cfg(target_os = "linux")]
 mod l2fwd;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-mod mdns;
 #[cfg(target_os = "linux")]
-mod mdnsd;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod mfid;
 #[cfg(target_os = "linux")]
@@ -27,7 +29,7 @@ use std::path::Path;
 use std::process::ExitCode;
 
 /// The names the stack runs under, and the symlinks `livi-link.sh` creates for them.
-const TOOLS: [&str; 8] = [
+const TOOLS: [&str; 10] = [
     "seedrng",
     "mfid",
     "livi-usbproxy",
@@ -36,8 +38,10 @@ const TOOLS: [&str; 8] = [
     "wifid",
     "btd",
     "iapd",
+    "ledd",
+    "httpd",
 ];
-const COMMANDS: [&str; 4] = ["wifi-channels", "bt-probe", "bt-mgmt", "sdp-dump"];
+const COMMANDS: [&str; 5] = ["wifi-channels", "bt-probe", "bt-mgmt", "sdp-dump", "sync-scripts"];
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -67,13 +71,39 @@ fn main() -> ExitCode {
         #[cfg(target_os = "linux")]
         "l2fwd" => l2fwd::run(&rest),
         #[cfg(target_os = "linux")]
-        "mdnsd" => mdnsd::run(&rest),
+        "mdnsd" => livi_mdns::daemon::run(&rest),
         #[cfg(target_os = "linux")]
         "wifid" => wifid::run(),
+        // Unified web UI.
+        #[cfg(target_os = "linux")]
+        "httpd" => ExitCode::from(livi_web::run(livi_web::WebCaps {
+            model: "CPC200-CCPA".into(),
+            port: 80,
+            wifi_iface: "wlan0".into(),
+            bridge: None,
+            host_iface: "ncm0".into(),
+            bt: "hci0".into(),
+            led: false,
+            flash: livi_web::Flash {
+                stack: Some(livi_web::Stack {
+                    install_to: "/script/livi/cpc200-ccpa.gz".into(),
+                    restart: "sh /script/livi/livi-link.sh --fresh".into(),
+                }),
+                rootfs: Some(livi_web::Rootfs {
+                    script: "/script/livi/flash-image.sh".into(),
+                    partition: "rootfs".into(),
+                }),
+                ..Default::default()
+            },
+        }) as u8),
         #[cfg(target_os = "linux")]
         "btd" => bt::run(),
         #[cfg(target_os = "linux")]
+        "ledd" => ledd::run(),
+        #[cfg(target_os = "linux")]
         "iapd" => iapd::run(&rest),
+        #[cfg(target_os = "linux")]
+        "sync-scripts" => install::run(),
         #[cfg(target_os = "linux")]
         "wifi-channels" => livi_wifi::run(),
         #[cfg(target_os = "linux")]
