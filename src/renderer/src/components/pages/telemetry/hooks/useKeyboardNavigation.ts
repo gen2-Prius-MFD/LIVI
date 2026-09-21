@@ -6,20 +6,18 @@ import { useCallback, useRef } from 'react'
 type UseKeyboardNavigationProps = {
   dashboards: ArrayLike<unknown>
   index: number
-  isNavbarHidden: boolean
   onSetIndex: React.Dispatch<React.SetStateAction<number>>
 }
 
 export const useKeyboardNavigation = ({
   dashboards,
   index,
-  isNavbarHidden,
   onSetIndex
 }: UseKeyboardNavigationProps) => {
   const startRef = useRef<{ x: number; y: number; t: number } | null>(null)
   const pagerStateRef = useRef({ index: 0, len: 0 })
 
-  const { revealDots } = usePaginationDots(isNavbarHidden)
+  const { revealDots } = usePaginationDots(true)
 
   const handleNavigate = useCallback(
     (dir: -1 | 1) => {

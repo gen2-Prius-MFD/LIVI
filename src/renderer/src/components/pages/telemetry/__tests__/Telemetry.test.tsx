@@ -4,16 +4,11 @@ import React from 'react'
 import { Telemetry } from '../Telemetry'
 
 const useLiviStoreMock = vi.fn()
-const useNavbarHiddenMock = vi.fn()
 const useKeyboardNavigationMock = vi.fn()
 const normalizeDashComponentsMock = vi.fn()
 
 vi.mock('@store/store', () => ({
   useLiviStore: (selector: (state: { settings: unknown }) => unknown) => useLiviStoreMock(selector)
-}))
-
-vi.mock('@renderer/hooks/useNavbarHidden', () => ({
-  useNavbarHidden: () => useNavbarHiddenMock()
 }))
 
 vi.mock('../hooks/useKeyboardNavigation', () => ({
@@ -94,8 +89,6 @@ describe('Telemetry', () => {
         }
       })
     )
-
-    useNavbarHiddenMock.mockReturnValue({ isNavbarHidden: false })
 
     normalizeDashComponentsMock.mockReturnValue({
       dashboards: [{ id: 'dash1', pos: 1 }]
@@ -202,14 +195,6 @@ describe('Telemetry', () => {
     renderWithContext(<Telemetry />, {})
 
     expect(screen.getByTestId('dash-1')).toBeInTheDocument()
-  })
-
-  test('uses fixed positioning when navbar is hidden', async () => {
-    useNavbarHiddenMock.mockReturnValue({ isNavbarHidden: true })
-
-    const { container } = renderWithContext(<Telemetry />)
-
-    expect(container.firstChild).toHaveStyle({ position: 'fixed' })
   })
 
   test('falls back when the active index points past the available dashboards', async () => {

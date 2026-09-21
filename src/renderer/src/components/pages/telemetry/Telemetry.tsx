@@ -4,7 +4,6 @@ import { DashboardsPagination } from '@renderer/components/pages/telemetry/compo
 import { DashboardConfig } from '@renderer/components/pages/telemetry/config'
 import { normalizeDashComponents } from '@renderer/components/pages/telemetry/utils'
 import { AppContext } from '@renderer/context'
-import { useNavbarHidden } from '@renderer/hooks/useNavbarHidden'
 import type { WindowId } from '@shared/types'
 import { useLiviStore } from '@store/store'
 import { clamp } from '@utils/index'
@@ -23,10 +22,8 @@ export const Telemetry: FC<TelemetryProps> = ({ windowRole = 'main' }) => {
   const [index, setIndex] = useState(0)
 
   const { dashboards } = normalizeDashComponents(settings?.dashboards, windowRole)
-  const { isNavbarHidden, isNavPresent } = useNavbarHidden()
   const { prev, next, canPrev, canNext, onPointerDown, onPointerUp } = useKeyboardNavigation({
     dashboards,
-    isNavbarHidden,
     index,
     onSetIndex: setIndex
   })
@@ -102,8 +99,8 @@ export const Telemetry: FC<TelemetryProps> = ({ windowRole = 'main' }) => {
           activeIndex={index}
           dotsLength={Number(dashboards.length)}
           onSetIndex={setIndex}
-          isNavbarHidden={isNavbarHidden}
-          isNavPresent={isNavPresent}
+          isNavbarHidden={true}
+          isNavPresent={false}
         />
       )}
     </Box>
