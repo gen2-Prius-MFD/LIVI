@@ -100,12 +100,6 @@ describe('SecondaryAppShell — initial route selection', () => {
     expect(screen.queryByTestId('cluster-page')).toBeNull()
   })
 
-  test('media routes when only media is enabled', async () => {
-    state.settings = { media: { dash: true } }
-    await renderShell('dash')
-    expect(screen.getByTestId('media-page')).toHaveAttribute('data-hydrate', 'true')
-  })
-
   test('camera routes when only camera is enabled', async () => {
     state.settings = { camera: { dash: true } }
     await renderShell('dash')

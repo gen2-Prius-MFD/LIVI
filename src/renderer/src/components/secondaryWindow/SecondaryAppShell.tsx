@@ -11,7 +11,6 @@ import { broadcastMediaKey } from '../../utils/broadcastMediaKey'
 import { AppLayout } from '../layouts/AppLayout'
 import { Camera } from '../pages/camera'
 import { Cluster } from '../pages/cluster/Cluster'
-import { Media } from '../pages/media'
 import { Telemetry } from '../pages/telemetry'
 
 const TRANSPORT_ACTIONS: BindKey[] = [
@@ -58,7 +57,7 @@ export const SecondaryAppShell = ({ role, emptyLabel }: Props) => {
     )
   }
 
-  const initialPath = hasTelemetry ? ROUTES.TELEMETRY : hasMedia ? ROUTES.MEDIA : ROUTES.CAMERA
+  const initialPath = hasTelemetry ? ROUTES.TELEMETRY : ROUTES.CAMERA
 
   return (
     <MemoryRouter initialEntries={[initialPath]}>
@@ -165,7 +164,6 @@ const SecondaryShellInner = ({ role }: InnerProps) => {
       )}
       <Routes>
         <Route path={ROUTES.TELEMETRY} element={<Telemetry windowRole={role} />} />
-        <Route path={ROUTES.MEDIA} element={<Media forceHydrate />} />
         <Route path={ROUTES.CAMERA} element={<Camera />} />
         <Route path="*" element={null} />
       </Routes>

@@ -35,7 +35,6 @@ describe('pages index', () => {
     expect(mod.Camera).toBe('CameraMock')
     expect(mod.Projection).toBe('ProjectionMock')
     expect(mod.Cluster).toBe('ClusterMock')
-    expect(mod.Media).toBe('MediaMock')
     expect(mod.SettingsPage).toBe('SettingsPageMock')
     expect(mod.Telemetry).toBe('TelemetryMock')
   })

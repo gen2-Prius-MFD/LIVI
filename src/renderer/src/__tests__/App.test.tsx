@@ -26,7 +26,6 @@ vi.mock('../components/pages', () => ({
   Projection: (props: any) => <div data-testid="projection">{String(props.receivingVideo)}</div>,
   Cluster: () => <div data-testid="cluster" />,
   Home: () => <div data-testid="home" />,
-  Media: () => <div data-testid="media" />,
   Camera: () => <div data-testid="camera" />,
   Custom: () => <div data-testid="custom" />,
   Maps: () => <div data-testid="maps" />,
@@ -64,7 +63,7 @@ vi.mock('../hooks', () => ({
 
 const liviState: any = {
   settings: {
-    startPage: '/media',
+    startPage: '/settings',
     language: 'en',
     bindings: { back: 'KeyB', selectDown: 'Enter' }
   },
@@ -106,7 +105,7 @@ describe('App', () => {
     focusFirstInMainMock.mockReset()
     mockPathname = '/'
     liviState.settings = {
-      startPage: '/media',
+      startPage: '/settings',
       language: 'en',
       bindings: { back: 'KeyB', selectDown: 'Enter' }
     }
@@ -171,7 +170,7 @@ describe('App', () => {
 
     fireEvent.keyDown(document, { code: 'ArrowRight' })
 
-    mockPathname = '/media'
+    mockPathname = '/settings'
     rerender(
       <AppContext.Provider value={{ isTouchDevice: false } as any}>
         <App />
@@ -401,7 +400,7 @@ describe('App', () => {
     }
     statusState.reverse = true
     statusState.cameraFound = true
-    mockPathname = '/media'
+    mockPathname = '/settings'
     render(<App />)
     expect(navigateMock).toHaveBeenCalledWith('/camera')
   })
@@ -415,7 +414,7 @@ describe('App', () => {
     }
     statusState.reverse = true
     statusState.cameraFound = true
-    mockPathname = '/media'
+    mockPathname = '/settings'
     render(<App />)
     expect(navigateMock).not.toHaveBeenCalledWith('/camera')
   })
@@ -429,7 +428,7 @@ describe('App', () => {
     }
     statusState.reverse = true
     statusState.cameraFound = true
-    mockPathname = '/media'
+    mockPathname = '/settings'
     render(<App />)
     expect(navigateMock).not.toHaveBeenCalledWith('/camera')
   })
@@ -443,7 +442,7 @@ describe('App', () => {
     }
     statusState.reverse = true
     statusState.cameraFound = true
-    mockPathname = '/media'
+    mockPathname = '/settings'
     const { rerender } = render(<App />)
     expect(navigateMock).toHaveBeenCalledWith('/camera')
 
@@ -452,7 +451,7 @@ describe('App', () => {
     statusState.reverse = false
     navigateMock.mockClear()
     rerender(<App />)
-    expect(navigateMock).toHaveBeenCalledWith('/media')
+    expect(navigateMock).toHaveBeenCalledWith('/settings')
   })
 
   test('mounts without redirecting when settings are missing', async () => {
@@ -623,7 +622,7 @@ describe('App', () => {
     }
     statusState.reverse = true
     statusState.cameraFound = true
-    mockPathname = '/media'
+    mockPathname = '/settings'
     render(<App />)
     expect(navigateMock).toHaveBeenCalledWith('/camera')
     getWindowRole.mockReturnValue('main')
@@ -640,7 +639,7 @@ describe('App', () => {
     }
     statusState.reverse = true
     statusState.cameraFound = true
-    mockPathname = '/media'
+    mockPathname = '/settings'
     render(<App />)
     expect(navigateMock).not.toHaveBeenCalledWith('/camera')
     getWindowRole.mockReturnValue('main')
@@ -677,14 +676,14 @@ describe('App', () => {
   })
 
   test('external navigation request routes to the requested path', async () => {
-    statusState.requestedPath = '/media'
+    statusState.requestedPath = '/settings'
     mockPathname = '/'
     render(<App />)
-    expect(navigateMock).toHaveBeenCalledWith('/media')
+    expect(navigateMock).toHaveBeenCalledWith('/settings')
   })
 
   test('a handled request is consumed so the same path can be sent again', async () => {
-    statusState.requestedPath = '/media'
+    statusState.requestedPath = '/settings'
     mockPathname = '/'
     render(<App />)
     expect(statusState.clearRequestedPath).toHaveBeenCalled()
@@ -692,7 +691,7 @@ describe('App', () => {
 
   test('external navigation request with no path does not navigate', async () => {
     statusState.requestedPath = null
-    mockPathname = '/media'
+    mockPathname = '/settings'
     render(<App />)
     expect(navigateMock).not.toHaveBeenCalled()
   })
@@ -740,10 +739,10 @@ describe('App', () => {
   })
 
   test('requesting the current path does not navigate again', async () => {
-    statusState.requestedPath = '/media'
-    mockPathname = '/media'
+    statusState.requestedPath = '/settings'
+    mockPathname = '/settings'
     render(<App />)
-    expect(navigateMock).not.toHaveBeenCalledWith('/media')
+    expect(navigateMock).not.toHaveBeenCalledWith('/settings')
   })
 
   test('a settings route is reachable', async () => {

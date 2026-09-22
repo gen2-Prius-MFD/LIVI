@@ -2,13 +2,12 @@ import { PAGES, ROUTES } from '@shared/types'
 import type { ReactElement } from 'react'
 import type { RouteObject } from 'react-router'
 import { Layout } from '../components/layouts/Layout'
-import { Camera, Custom, Media, Telemetry } from '../components/pages'
+import { Camera, Custom, Telemetry } from '../components/pages'
 import { SettingsPage } from '../components/pages/settings/SettingsPage'
 import { settingsRoutes } from './schemas/schema'
 
 const elements: Partial<Record<ROUTES, ReactElement>> = {
   [ROUTES.TELEMETRY]: <Telemetry />,
-  [ROUTES.MEDIA]: <Media />,
   [ROUTES.CAMERA]: <Camera />,
   [ROUTES.CUSTOM]: <Custom />
 }
