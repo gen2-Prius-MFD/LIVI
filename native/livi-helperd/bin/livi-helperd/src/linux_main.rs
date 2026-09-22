@@ -104,7 +104,10 @@ fn bt_adapter(dc: &DeviceConfig) -> String {
     livi_dongle::bt::attach(
         move |index| {
             ours.store(true, std::sync::atomic::Ordering::Relaxed);
-            let _ = tx.send(index);
+            if tx.send(index).is_err() {
+                eprintln!("[bt] the dongle's controller arrived late, starting over with it");
+                std::process::exit(1);
+            }
         },
         move || {
             if lost.load(std::sync::atomic::Ordering::Relaxed) {
@@ -392,6 +395,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
                     aa_events.clone(),
                     wired_phones.clone(),
                     hfp,
+                    state.clone(),
                 ));
             }
             Err(e) => eprintln!("[aa] profile registration failed: {e}"),
@@ -519,7 +523,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
                 let cfg = LinkConfig { max_outgoing: 4, control_version: 2, ..LinkConfig::default() };
                 let (channel, art_rx) = spawn_link_stream(session.stream, cfg, false);
                 let (tx, rx) = tokio::sync::mpsc::channel(64);
-                let (accessory, mac) = (run_accessory(channel, auth, identity.clone(), cp.clone(), tx), session.peer.to_string());
+                let (accessory, mac) = (run_accessory(channel, auth, identity.clone(), cp.clone(), tx, state.vehicle_feed()), session.peer.to_string());
                 let links = state.clone();
                 tokio::spawn(async move {
                     links.link_up(&mac);
@@ -540,7 +544,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
                 let cfg = LinkConfig { max_outgoing: 4, control_version: 2, ..LinkConfig::default() };
                 let (channel, art_rx) = spawn_link(conn.fd, cfg, false);
                 let (tx, rx) = tokio::sync::mpsc::channel(64);
-                let (accessory, mac) = (run_accessory(channel, auth, identity.clone(), cp.clone(), tx), conn.peer_mac.clone());
+                let (accessory, mac) = (run_accessory(channel, auth, identity.clone(), cp.clone(), tx, state.vehicle_feed()), conn.peer_mac.clone());
                 let links = state.clone();
                 tokio::spawn(async move {
                     links.link_up(&mac);

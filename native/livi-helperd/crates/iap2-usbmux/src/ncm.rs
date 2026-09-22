@@ -116,8 +116,30 @@ fn open_tap(ifname: &str) -> Result<OwnedFd, String> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
-fn run_cmd(program: &str, args: &[&str]) {
-    let _ = Command::new(program).args(args).output();
+fn run_cmd(program: &str, args: &[&str]) -> bool {
+    Command::new(program).args(args).output().is_ok_and(|o| o.status.success())
+}
+
+/// Link-local only, since NetworkManager takes a link down when its DHCP gets no answer. Bound
+/// to the MAC, not the name: a LIVI Link is a usb0 too, and there the host is a DHCP client.
+fn link_local_profile(ifname: &str) {
+    let _ = fs::write(format!("/proc/sys/net/ipv6/conf/{ifname}/accept_dad"), "0");
+    run_cmd("ip", &["link", "set", ifname, "up"]);
+    // What earlier builds bound to the interface name.
+    run_cmd("nmcli", &["connection", "delete", &format!("livi-carkit-{ifname}")]);
+    let Ok(mac) = fs::read_to_string(format!("/sys/class/net/{ifname}/address")) else { return };
+    let mac = mac.trim().to_uppercase();
+    let name = format!("livi-carkit-{}", mac.replace(':', ""));
+    if !run_cmd("nmcli", &["-g", "connection.id", "connection", "show", &name]) {
+        let added = run_cmd("nmcli", &[
+            "connection", "add", "type", "ethernet", "con-name", &name,
+            "ethernet.mac-address", &mac,
+            "ipv4.method", "disabled", "ipv6.method", "link-local", "ipv6.addr-gen-mode", "eui64",
+            "connection.autoconnect", "yes", "connection.autoconnect-priority", "999",
+        ]);
+        println!("[ncm] NetworkManager profile {name}: {}", if added { "added" } else { "not added" });
+    }
+    run_cmd("nmcli", &["connection", "up", &name, "ifname", ifname]);
 }
 
 impl NcmBridge {
@@ -129,6 +151,7 @@ impl NcmBridge {
 
         if let Some(ifname) = kernel_ncm_iface(&dev.sysfs) {
             println!("[ncm] using kernel cdc_ncm interface {ifname}");
+            link_local_profile(&ifname);
             return Ok(Self { ifname, run: None });
         }
 

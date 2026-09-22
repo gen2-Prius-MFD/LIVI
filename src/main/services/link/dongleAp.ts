@@ -14,6 +14,7 @@ const BT_PORT = 5005
 /** Applying waits for the radio, and a 5 GHz start spends the first seconds scanning. */
 const APPLY_MS = 30_000
 const PROBE_MS = 1500
+const DRIFT_RETRY_MS = 30_000
 
 /**
  * Runs commands on one connection, in order, and gives up on the first one the dongle refuses.
@@ -65,7 +66,7 @@ function talk(commands: string[], timeoutMs = APPLY_MS, port = PORT): Promise<st
   })
 }
 
-/** What the dongle is told for this configuration. */
+/** Full configuration */
 export function commandsFor(config: Config): string[] {
   if (config.wifiInterface !== DONGLE_LINK) {
     // Its radio would only sit next to the one actually in use.
@@ -75,6 +76,7 @@ export function commandsFor(config: Config): string[] {
     `set ssid ${config.carName || 'LIVI'}`,
     `set country ${config.country || 'DE'}`,
     `set channel ${config.wifiChannel || 36}`,
+    `set width ${config.wifiChannelWidth || 40}`,
     `set passphrase ${config.wifiPassword || '12345678'}`,
     'apply',
     // Keeps the whole state across a reboot. Only a boot that reaches neither the USB link nor
@@ -83,8 +85,14 @@ export function commandsFor(config: Config): string[] {
   ]
 }
 
+// On Linux the host drives the dongle's controller itself, over the tunnel.
+function accessoryOnDongle(): boolean {
+  return process.platform !== 'linux' || process.env.LIVI_BT_VIA_DONGLE === '1'
+}
+
 export function btCommandsFor(config: Config): string[] {
   if (config.btAdapter !== DONGLE_LINK || !config.wirelessCpEnabled) return ['off']
+  if (!accessoryOnDongle()) return ['off']
   // Who may be paged comes from the paging list the helper hands over, not from here.
   return ['on']
 }
@@ -147,9 +155,42 @@ function report(what: string, err: unknown): void {
   else console.warn(`[dongleAp] ${what}:`, String(err))
 }
 
+let wanted: Config | null = null
+let told = false
+let reconciling = false
+let lastDriftAt = 0
+let lastTryAt = 0
+
+/** Fed with every status poll. */
+export function noteDongleStatus(status: Record<string, string> | null): void {
+  if (!status) {
+    told = false
+    lastTryAt = 0
+    return
+  }
+  if (!wanted || reconciling) return
+  if (!told && Date.now() - lastTryAt < DRIFT_RETRY_MS) return
+  const drifted = (status.state === 'on') !== (wanted.wifiInterface === DONGLE_LINK)
+  if (told && !(drifted && Date.now() - lastDriftAt > DRIFT_RETRY_MS)) return
+  if (told) lastDriftAt = Date.now()
+  void reconcileDongleAp(wanted)
+}
+
 /** Hands the dongle its settings when it is the chosen AP, and silences it when it is not. */
 export async function reconcileDongleAp(config: Config): Promise<void> {
-  if (!attached()) return
+  wanted = config
+  if (!attached() || reconciling) return
+  reconciling = true
+  try {
+    await reconcile(config)
+  } finally {
+    reconciling = false
+  }
+}
+
+async function reconcile(config: Config): Promise<void> {
+  lastTryAt = Date.now()
+  let heard = true
   try {
     const answers = await talk([...commandsFor(config), 'status'])
     apMac =
@@ -159,16 +200,20 @@ export async function reconcileDongleAp(config: Config): Promise<void> {
         .trim() || apMac
   } catch (err) {
     // Nothing local depends on the dongle, so a refusal is noted and the rest goes on.
+    heard = false
     report('access point', err)
   }
+  // The dongle's own Bluetooth stays off until it is told otherwise, so this has to arrive.
   try {
     await talk(btCommandsFor(config), APPLY_MS, BT_PORT)
   } catch (err) {
+    heard = false
     report('bluetooth', err)
   }
+  told = heard
 }
 
-/** Switches off what LIVI switched on. The dongle brings both back by itself on its next boot. */
+/** Switches off what LIVI switched on. */
 export async function releaseDongle(): Promise<void> {
   if (!attached()) return
   await Promise.allSettled([talk(['off'], PROBE_MS), talk(['off'], PROBE_MS, BT_PORT)])
