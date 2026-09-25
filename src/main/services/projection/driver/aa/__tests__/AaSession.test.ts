@@ -64,6 +64,8 @@ vi.mock('../stack/index', async () => {
   const real = await vi.importActual('../stack/index')
   return {
     ...real,
+    detectBtMac: () => hw.bt,
+    detectWifiBssid: () => hw.bssid,
     AAStack: vi.fn().mockImplementation(function (cfg: unknown) {
       const aa = new MockAAStack(cfg)
       lastAaStack.instance = aa
@@ -74,6 +76,14 @@ vi.mock('../stack/index', async () => {
 
 vi.mock('@main/services/audio/micTap', () => ({
   MicTap: { open: (path: string, opts: unknown) => micTapOpen(path, opts) }
+}))
+
+const { hw } = vi.hoisted(() => ({
+  hw: { bt: undefined as string | undefined, bssid: undefined as string | undefined }
+}))
+vi.mock('@main/services/link/dongleAp', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@main/services/link/dongleAp')>()),
+  dongleApMac: () => hw.bssid
 }))
 
 import type { Config } from '@shared/types'
@@ -164,6 +174,8 @@ afterEach(() => {
 describe('AaSession: host volume hook', () => {
   test('setStreamVolume forwards to the media sink, the same shape CarPlay uses', () => {
     const setHostVolume = vi.fn()
+    const setVideoActive = vi.fn()
+    const setAudioActive = vi.fn()
     const s = new AaSession({
       transport: fakeLink(),
       getConfig: () => baseCfg(),
@@ -174,6 +186,8 @@ describe('AaSession: host volume hook', () => {
         videoPlaneId: () => 1,
         primeVideo: vi.fn(),
         noteVideoStarted: vi.fn(),
+        setVideoActive,
+        setAudioActive,
         audioOutputs: () => [],
         onAudioOutput: () => () => {},
         primeAudio: vi.fn(),
@@ -182,6 +196,41 @@ describe('AaSession: host volume hook', () => {
     })
     s.setStreamVolume(3, 0.5, 40)
     expect(setHostVolume).toHaveBeenCalledWith(3, 0.5, 40)
+
+    s.setVideoActive(false)
+    expect(setVideoActive.mock.calls).toEqual([
+      [false, false],
+      [true, false]
+    ])
+    expect(setAudioActive).toHaveBeenCalledWith(false)
+  })
+})
+
+describe('AaSession: hardware addresses in the stack config', () => {
+  afterEach(() => {
+    hw.bt = undefined
+    hw.bssid = undefined
+  })
+
+  test('the detected addresses reach the config, and nothing is set when there are none', () => {
+    makeSession()
+    let cfg = lastAaStack.instance!.cfg as Record<string, unknown>
+    expect(cfg.btMacAddress).toBeUndefined()
+    expect(cfg.wifiBssid).toBeUndefined()
+
+    hw.bt = 'AA:BB:CC:DD:EE:FF'
+    hw.bssid = '11:22:33:44:55:66'
+    makeSession()
+    cfg = lastAaStack.instance!.cfg as Record<string, unknown>
+    expect(cfg.btMacAddress).toBe('AA:BB:CC:DD:EE:FF')
+    expect(cfg.wifiBssid).toBe('11:22:33:44:55:66')
+  })
+
+  test('the dongle answers for its own access point instead of a host interface', () => {
+    hw.bssid = '99:88:77:66:55:44'
+    makeSession({ cfg: { ...baseCfg(), wifiInterface: 'livi-link' } as unknown as Config })
+    const cfg = lastAaStack.instance!.cfg as Record<string, unknown>
+    expect(cfg.wifiBssid).toBe('99:88:77:66:55:44')
   })
 })
 
@@ -267,6 +316,14 @@ describe('AaSession.close', () => {
     const d = makeSession()
     await d.close()
     await expect(d.close()).resolves.toBeUndefined()
+  })
+
+  test('disconnectPhone closes the session and says so only the first time', async () => {
+    const d = makeSession()
+    await expect(d.disconnectPhone()).resolves.toBe(true)
+    expect(lastAaStack.instance!.requestShutdown).toHaveBeenCalled()
+    expect(lastAaStack.instance!.stop).toHaveBeenCalled()
+    await expect(d.disconnectPhone()).resolves.toBe(false)
   })
 
   test('emits "disconnected" once when the session was up', async () => {

@@ -4,7 +4,6 @@ import { SystemSound } from '@main/services/audio'
 import { broadcastToSecondaryRenderers } from '@main/window/broadcast'
 import { getSecondaryWindow, secondaryWindowEvents } from '@main/window/secondaryWindows'
 import type { Config, DevListEntry } from '@shared/types'
-import { PhoneWorkMode } from '@shared/types'
 import { isInputCommand } from '@shared/types/InputCommand'
 import type { NavLocale } from '@shared/utils'
 import { clusterTargetScreens, isClusterDisplayed } from '@shared/utils'
@@ -44,8 +43,7 @@ import {
   MediaData,
   MediaType,
   type Message,
-  NavigationData,
-  PhoneType
+  NavigationData
 } from '../messages'
 import { TransportArbiter } from '../transport/TransportArbiter'
 import type { Transport } from '../transport/types'
@@ -61,8 +59,13 @@ import { MediaStore } from './MediaStore'
 import { NavStore } from './NavStore'
 import { ProjectionAudio } from './ProjectionAudio'
 import { ScoAudio } from './ScoAudio'
-import { type ProjectionSession, SessionManager, type SessionTransport } from './SessionManager'
-import { type PendingStartupConnectTarget, type ProjectionEvent } from './types'
+import {
+  type ProjectionSession,
+  SessionManager,
+  type SessionProtocol,
+  type SessionTransport
+} from './SessionManager'
+import { type ProjectionEvent } from './types'
 import { isPhoneLikeCod } from './utils/isPhoneLikeCod'
 import { VideoPlaneManager } from './VideoPlaneManager'
 
@@ -87,6 +90,18 @@ function deriveInitialNightMode(mode: string | undefined): boolean | undefined {
 // The retry stops on its own once the phone detaches and resets on a successful start.
 const START_RETRY_BASE_MS = 1000
 const START_RETRY_CAP_MS = 15000
+
+function apSignature(c: Config): string {
+  return [
+    c.wifiInterface,
+    c.carName,
+    c.wifiPassword,
+    c.wifiType,
+    c.wifiChannel,
+    c.wifiChannelWidth,
+    c.country
+  ].join('|')
+}
 
 export class ProjectionService {
   private readonly drivers: ProjectionDriverManager
@@ -124,7 +139,7 @@ export class ProjectionService {
   private readonly mediaStore = new MediaStore({
     emit: (p) => this.emitProjectionEvent(p),
     getPlaybackInferred: () => this.aaPlaybackInferred,
-    getLastPhoneType: () => this.lastPluggedPhoneType,
+    getLastProtocol: () => this.lastPluggedProtocol,
     onPlaybackStatus: (state) => this.bluez.setPlaybackStatus(state).catch(() => {})
   })
   private readonly navStore = new NavStore({
@@ -231,7 +246,7 @@ export class ProjectionService {
     this.maybeAutoActivate(
       this.sessions.upsert(session, 'androidauto', this.aaTransport(session), {})
     )
-    this.onPhoneConnected(PhoneType.AndroidAuto)
+    this.onPhoneConnected('androidauto')
     this.ensureAaPhoneHfp()
   }
 
@@ -295,7 +310,7 @@ export class ProjectionService {
         controllerId: session.getControllerId() ?? undefined
       })
     )
-    this.onPhoneConnected(PhoneType.CarPlay)
+    this.onPhoneConnected('carplay')
   }
   private readonly onCpDisconnected = (session: CpSession): void => {
     const closed = this.sessions.byDriver(session)
@@ -456,8 +471,8 @@ export class ProjectionService {
   }
 
   // Hydration
-  private readonly pluggedHooks: Array<(phoneType: PhoneType) => void> = []
-  public addPluggedHook(fn: (phoneType: PhoneType) => void): () => void {
+  private readonly pluggedHooks: Array<() => void> = []
+  public addPluggedHook(fn: () => void): () => void {
     this.pluggedHooks.push(fn)
     return (): void => {
       const i = this.pluggedHooks.indexOf(fn)
@@ -473,17 +488,21 @@ export class ProjectionService {
   // the renderer is attached.
   private earlyVideoQueues: Map<string, Array<Record<string, unknown>>> = new Map()
   private static readonly EARLY_QUEUE_MAX_PER_CHANNEL = 256
-  private lastPluggedPhoneType?: PhoneType
+  private lastPluggedProtocol?: SessionProtocol
   /** Canonical MediaPlayStatus (1 = playing, 0 = paused), inferred from AA audio commands. */
   private aaPlaybackInferred: 1 | 0 = 1
 
   private audio: ProjectionAudio
   private systemSound = new SystemSound(() => this.config)
 
+  /** What the access point was started with, once the boot config is in. */
+  private apSig: string | null = null
+
   private readonly onConfigChanged = (next: Config) => {
     if (this.shuttingDown) return
     const prev = this.config
     this.config = { ...this.config, ...next }
+    this.apSig ??= apSignature(this.config)
 
     const prevClusterActive = isClusterDisplayed(prev)
     const nextClusterActive = isClusterDisplayed(this.config)
@@ -628,32 +647,23 @@ export class ProjectionService {
     return this.codecCaps.hevc
   }
 
-  private onPhoneConnected(phoneType: PhoneType): void {
+  private onPhoneConnected(protocol: SessionProtocol): void {
     this.clearTimeouts()
-    this.lastPluggedPhoneType = phoneType
+    this.lastPluggedProtocol = protocol
     this.aaPlaybackInferred = 1
     this.lastVideoWidth = undefined
     this.lastVideoHeight = undefined
     this.lastClusterVideoWidth = undefined
     this.lastClusterVideoHeight = undefined
 
-    const nextPhoneWorkMode =
-      phoneType === PhoneType.CarPlay ? PhoneWorkMode.CarPlay : PhoneWorkMode.Android
-
-    try {
-      configEvents.emit('requestSave', { lastPhoneWorkMode: nextPhoneWorkMode })
-    } catch (e) {
-      console.warn('[ProjectionService] failed to persist lastPhoneWorkMode (ignored)', e)
-    }
-
-    this.emitProjectionEvent({ type: 'plugged', phoneType })
+    this.emitProjectionEvent({ type: 'plugged' })
     this.statusFile.setProjection(
       this.getActiveTransport(),
-      phoneType === PhoneType.CarPlay ? 'CarPlay' : 'AndroidAuto'
+      protocol === 'carplay' ? 'CarPlay' : 'AndroidAuto'
     )
     for (const fn of this.pluggedHooks) {
       try {
-        fn(phoneType)
+        fn()
       } catch (e) {
         console.warn('[ProjectionService] plugged hook threw (ignored)', e)
       }
@@ -662,7 +672,7 @@ export class ProjectionService {
 
   private onPhoneDisconnected(): void {
     this.clearTimeouts()
-    this.lastPluggedPhoneType = undefined
+    this.lastPluggedProtocol = undefined
     this.aaPlaybackInferred = 1
     // UI/status/nav are cleared only when no session is left active; the active-session case
     // runs through onActiveSessionChanged / teardownToIdle.
@@ -720,7 +730,7 @@ export class ProjectionService {
 
     if (msg.command != null) {
       this.statusFile.applyAudioCommand(msg.command)
-      if (this.lastPluggedPhoneType === PhoneType.AndroidAuto) {
+      if (this.lastPluggedProtocol === 'androidauto') {
         if (msg.command === 10) {
           this.aaPlaybackInferred = 1
           this.mediaStore.patchAaPlayStatus(this.sessions.active(), 1)
@@ -1006,6 +1016,11 @@ export class ProjectionService {
           if (cluster && !isClusterDisplayed(this.config)) return
           this.noteVideoGeometry(cluster, w, h)
         },
+        setVideoActive: (cluster, active) =>
+          gstHost.setActiveFeeder(cluster ? VIDEO_PLANE_CLUSTER_RECV : VIDEO_PLANE_MAIN, active),
+        setAudioActive: (active) => {
+          for (const o of this.audio.hostOutputs()) gstHost.setAudioActive(o.streamId, active)
+        },
         audioOutputs: () => this.audio.hostOutputs(),
         onAudioOutput: (cb) => this.audio.onHostOutput(cb),
         primeAudio: (audioType, sampleRate, channels, tag) =>
@@ -1175,6 +1190,7 @@ export class ProjectionService {
 
   public applyConfigPatch(patch: Partial<Config>): void {
     this.config = { ...this.config, ...patch }
+    this.apSig ??= apSignature(this.config)
     this.deviceController.resendReconnectTargets()
     this.syncHelperSupervisor()
   }
@@ -1267,6 +1283,11 @@ export class ProjectionService {
   // Restart the session to apply a config change that needs fresh negotiation
   public async restartSession(): Promise<void> {
     console.log('[ProjectionService] restartSession requested (settings/IPC)')
+    // A phone is paged onto the new access point, never off the old one, so this comes first.
+    if (this.apSig !== null && apSignature(this.config) !== this.apSig) {
+      this.apSig = apSignature(this.config)
+      await restartWifiAp(this.config)
+    }
     // Native CarPlay renegotiates the advertised displays on reconnect.
     if (this.cpActive) this.drivers.getCpManager()?.dropSessions()
 
@@ -1274,15 +1295,17 @@ export class ProjectionService {
     const wasWired = aaRouted && this.isActiveAaWired()
     const wasWireless = aaRouted && !this.isActiveAaWired()
 
+    // A wired phone is reset the way an unplug would, so it comes back as it does on a plug-in.
+    if (wasWired) {
+      const res = await this.bluez.restartUsb().catch((e) => ({ ok: false, error: String(e) }))
+      if (!res.ok) console.warn(`[ProjectionService] restartSession: restart-usb: ${res.error}`)
+      return
+    }
+
     try {
       await this.stop()
     } catch (e) {
       console.warn('[ProjectionService] restartSession: stop threw (ignored)', e)
-    }
-    await restartWifiAp(this.config)
-
-    if (wasWired) {
-      return
     }
 
     if (wasWireless) {
@@ -1800,7 +1823,7 @@ export class ProjectionService {
         this.audio.resetForSessionStart()
         this.lastVideoWidth = undefined
         this.lastVideoHeight = undefined
-        this.lastPluggedPhoneType = undefined
+        this.lastPluggedProtocol = undefined
         this.aaPlaybackInferred = 1
 
         this.mediaStore.reset('session-start')
@@ -1883,9 +1906,11 @@ export class ProjectionService {
       this.audio.restoreDuck(next.audio.duckLevel, next.audio.duckRampMs)
       const mc = next.video.main.codec ?? this.lastMainCodecByDriver.get(next.driver)
       const cc = next.video.cluster.codec ?? this.lastClusterCodecByDriver.get(next.driver)
-      // A same-codec switch keeps the running decoder — the host flushes it and replays the
-      // new session's cached GOP. Tearing it down mid-decode wedges the HEVC STREAMOFF.
-      if (mc !== undefined && mc !== this.planes.getMainCodec()) this.planes.dispose()
+      // The other protocol's stream is a new sequence, which the hardware decoder does not take
+      // mid-stream. Its feeder is held before the decoder goes, so the teardown finds it idle.
+      const switched = prev !== null && prev.protocol !== next.protocol
+      if (switched) this.syncVideoActiveFeeder()
+      if (switched || (mc !== undefined && mc !== this.planes.getMainCodec())) this.planes.dispose()
       this.mediaStore.hydrate(next)
       this.navStore.hydrate(next)
       // Restore the length-prefixed codec_data for this session (null for byte-stream sources).
@@ -1895,6 +1920,11 @@ export class ProjectionService {
         next.video.main.codecData ?? null,
         next.video.cluster.codecData ?? null
       )
+      // CarPlay's planes come back with the receiver's config; the fed ones are primed here.
+      if (switched && next.protocol === 'androidauto') {
+        this.planes.primeMain()
+        this.planes.primeClusters()
+      }
       console.log(
         `[SESSIONS] codec-restore #${next.index} ${next.protocol}: session=${next.video.main.codec ?? '-'} map=${this.lastMainCodecByDriver.get(next.driver) ?? '-'} → gstVideoCodec=${this.planes.getMainCodec()}`
       )
@@ -1955,6 +1985,9 @@ export class ProjectionService {
       this.clearTimeouts()
 
       try {
+        // clear() does not report an active-session change, so the renderer hears it from here.
+        this.emitProjectionEvent({ type: 'projection', shown: false })
+        this.statusFile.setStreaming(false)
         const wc = this.webContents
         if (wc && !wc.isDestroyed()) {
           wc.send('projection-event', { type: 'unplugged' })
@@ -1976,7 +2009,7 @@ export class ProjectionService {
       this.navStore.reset('session-stop')
       this.lastVideoWidth = undefined
       this.lastVideoHeight = undefined
-      this.lastPluggedPhoneType = undefined
+      this.lastPluggedProtocol = undefined
       this.aaPlaybackInferred = 0
     })().finally(() => {
       this.stopPromise = null

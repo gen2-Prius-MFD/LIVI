@@ -1130,6 +1130,73 @@ describe('CpStack commands', () => {
     expect(speech).toHaveBeenNthCalledWith(2, false)
   })
 
+  it('does not read a phone call as Siri, which the phone flags as speech too', async () => {
+    const { stack, session } = await fresh(true)
+    const speech = vi.fn()
+    stack.on('speech-active', speech)
+    internals(stack)._handleCommand(
+      cmd('modesChanged', {
+        appStates: [
+          { appStateID: 2, entity: 1 },
+          { appStateID: 1, entity: 1, speechMode: 1 }
+        ]
+      }),
+      session
+    )
+    expect(speech).not.toHaveBeenCalled()
+  })
+
+  it('ends the Siri attention when Siri places a call', async () => {
+    const { stack, session } = await fresh(true)
+    const speech = vi.fn()
+    stack.on('speech-active', speech)
+    internals(stack)._handleCommand(
+      cmd('modesChanged', {
+        appStates: [
+          { appStateID: 2, entity: 0 },
+          { appStateID: 1, entity: 1, speechMode: 1 }
+        ]
+      }),
+      session
+    )
+    // The call starts in its own message, which carries no speech state.
+    internals(stack)._handleCommand(
+      cmd('modesChanged', { appStates: [{ appStateID: 2, entity: 1 }] }),
+      session
+    )
+    expect(speech).toHaveBeenNthCalledWith(1, true)
+    expect(speech).toHaveBeenNthCalledWith(2, false)
+  })
+
+  it('the end of the call stream lets Siri register again', async () => {
+    const { stack, session } = await fresh(true)
+    await internals(stack)._setupAudio(
+      { streamConnectionID: 1, audioType: 'telephony', audioFormat: 0x100 },
+      session,
+      100
+    )
+    const speech = vi.fn()
+    stack.on('speech-active', speech)
+    internals(stack)._handleCommand(
+      cmd('modesChanged', {
+        appStates: [
+          { appStateID: 2, entity: 1 },
+          { appStateID: 1, entity: 1, speechMode: 1 }
+        ]
+      }),
+      session
+    )
+    expect(speech).not.toHaveBeenCalled()
+
+    // The phone never reported the call over, so the stream's end has to clear it.
+    internals(stack)._closeAudio(session.audioMeta[0])
+    internals(stack)._handleCommand(
+      cmd('modesChanged', { appStates: [{ appStateID: 1, entity: 1, speechMode: 1 }] }),
+      session
+    )
+    expect(speech).toHaveBeenCalledWith(true)
+  })
+
   it('ignores modesChanged without a usable appStates list', async () => {
     const { stack, session } = await fresh()
     const speech = vi.fn()

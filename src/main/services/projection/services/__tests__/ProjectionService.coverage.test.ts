@@ -21,6 +21,7 @@ const bluezMock = {
   disconnect: vi.fn(async (_mac: string) => ({ ok: true })),
   disconnectProfile: vi.fn(async (_mac: string, _uuid: string) => ({ ok: true })),
   setPlaybackStatus: vi.fn(async () => ({ ok: true })),
+  restartUsb: vi.fn(async () => ({ ok: true, count: 1 })),
   setScoSink: vi.fn(async () => ({ ok: true })),
   deauthApClients: vi.fn(async () => undefined),
   setWiredPhones: vi.fn(async () => undefined),
@@ -69,7 +70,6 @@ vi.mock('../../messages', async () => {
       constructor(public phoneType?: number) {}
     },
     Unplugged: class {},
-    PhoneType: { CarPlay: 3, AndroidAuto: 5 },
     BluetoothPairedList: class {
       constructor(public data?: unknown) {}
     },
@@ -144,6 +144,8 @@ const { configEventsMock } = vi.hoisted(() => ({
   configEventsMock: { on: vi.fn(), off: vi.fn(), emit: vi.fn() }
 }))
 vi.mock('@main/ipc/utils', () => ({ configEvents: configEventsMock }))
+const restartWifiApMock = vi.hoisted(() => vi.fn(async () => undefined))
+vi.mock('../../driver/helper/wifiApUnit', () => ({ restartWifiAp: restartWifiApMock }))
 
 const playerCreatedHook: { cb: (() => void) | null } = { cb: null }
 vi.mock('../../../video/GstVideo', async (importOriginal) => {
@@ -186,6 +188,7 @@ vi.mock('../../../audio/AudioDeviceEnumerator', () => ({
   })
 }))
 
+import { gstHost } from '@main/services/video/gstHost'
 import { webContents as electronWebContents } from 'electron'
 import { ProjectionAudio } from '../ProjectionAudio'
 import { ProjectionService } from '../ProjectionService'
@@ -464,6 +467,20 @@ describe('ProjectionService video handling', () => {
     sink.setHostVolume(3, 0.5, 80)
     expect(svc.audio.setHostStreamVolume).toHaveBeenCalledWith(3, 0.5, 80)
     await expect(sink.feedPath()).resolves.toBe('/tmp/media.feed')
+
+    // A held session keeps its streams, but what it feeds stops in the host.
+    const feeder = vi.spyOn(gstHost, 'setActiveFeeder').mockImplementation(() => {})
+    const audioActive = vi.spyOn(gstHost, 'setAudioActive').mockImplementation(() => {})
+    sink.setVideoActive(false, false)
+    sink.setVideoActive(true, true)
+    expect(feeder.mock.calls).toEqual([
+      [0x7a000001, false],
+      [0x7a000010, true]
+    ])
+    sink.setAudioActive(false)
+    expect(audioActive).toHaveBeenCalledWith(5, false)
+    feeder.mockRestore()
+    audioActive.mockRestore()
   })
 
   test('noteVideoGeometry tolerates no active session and a destroyed cluster target', () => {
@@ -712,7 +729,7 @@ describe('ProjectionService audio handling', () => {
     svc.webContents = { send }
     svc.statusFile.applyAudioCommand = vi.fn()
     svc.mediaStore.patchAaPlayStatus = vi.fn()
-    svc.lastPluggedPhoneType = 5
+    svc.lastPluggedProtocol = 'androidauto'
 
     svc.handleAudioData({ command: 10, audioType: 1, decodeType: 1, volume: 0.5 })
     expect(svc.aaPlaybackInferred).toBe(1)
@@ -731,7 +748,7 @@ describe('ProjectionService audio handling', () => {
     const svc = makeSvc()
     const send = vi.fn()
     svc.webContents = { send }
-    svc.lastPluggedPhoneType = 3
+    svc.lastPluggedProtocol = 'carplay'
 
     svc.handleAudioData({ decodeType: 1, audioType: 1 })
     svc.handleAudioData({ decodeType: 1, audioType: 1 })
@@ -745,7 +762,7 @@ describe('ProjectionService audio handling', () => {
 })
 
 describe('ProjectionService phone lifecycle events', () => {
-  test('onPhoneConnected persists work mode, emits plugged, and runs hooks', () => {
+  test('onPhoneConnected emits plugged and runs the hooks', () => {
     const svc = makeSvc()
     const send = vi.fn()
     svc.webContents = { send }
@@ -757,24 +774,11 @@ describe('ProjectionService phone lifecycle events', () => {
     })
     svc.addPluggedHook(throwingHook)
 
-    svc.onPhoneConnected(3)
+    svc.onPhoneConnected('carplay')
 
-    expect(configEventsMock.emit).toHaveBeenCalledWith('requestSave', {
-      lastPhoneWorkMode: expect.any(Number)
-    })
-    expect(send).toHaveBeenCalledWith('projection-event', { type: 'plugged', phoneType: 3 })
-    expect(hook).toHaveBeenCalledWith(3)
+    expect(send).toHaveBeenCalledWith('projection-event', { type: 'plugged' })
+    expect(hook).toHaveBeenCalled()
     expect(throwingHook).toHaveBeenCalled()
-  })
-
-  test('onPhoneConnected swallows a persistence failure', () => {
-    const svc = makeSvc()
-    svc.webContents = { send: vi.fn() }
-    svc.statusFile.setProjection = vi.fn()
-    ;(configEventsMock.emit as Mock).mockImplementationOnce(() => {
-      throw new Error('save boom')
-    })
-    expect(() => svc.onPhoneConnected(5)).not.toThrow()
   })
 
   test('addPluggedHook returns a disposer that removes the hook', () => {
@@ -785,7 +789,7 @@ describe('ProjectionService phone lifecycle events', () => {
     dispose()
     svc.webContents = { send: vi.fn() }
     svc.statusFile.setProjection = vi.fn()
-    svc.onPhoneConnected(5)
+    svc.onPhoneConnected('androidauto')
     expect(hook).not.toHaveBeenCalled()
   })
 
@@ -1644,7 +1648,7 @@ describe('ProjectionService constructor wiring closures', () => {
     const svc = makeSvc()
     svc.emitProjectionEvent = vi.fn()
     svc.aaPlaybackInferred = 2
-    svc.lastPluggedPhoneType = 5
+    svc.lastPluggedProtocol = 'androidauto'
     svc.config = { language: 'de' }
     svc.webContents = { id: 1, send: vi.fn() }
     svc.hostDevList = [{ id: 'x' }]
@@ -1656,7 +1660,7 @@ describe('ProjectionService constructor wiring closures', () => {
     svc.btPaired.getConnectedMac = vi.fn(() => 'AA:BB')
 
     expect(svc.mediaStore.deps.getPlaybackInferred()).toBe(2)
-    expect(svc.mediaStore.deps.getLastPhoneType()).toBe(5)
+    expect(svc.mediaStore.deps.getLastProtocol()).toBe('androidauto')
     svc.mediaStore.deps.emit({ type: 'media' })
     expect(svc.navStore.deps.getLanguage()).toBe('de')
     svc.navStore.deps.emit({ type: 'navigation' })
@@ -1979,15 +1983,83 @@ describe('ProjectionService transport switch / restart / connect', () => {
     expect(dropSessions).toHaveBeenCalled()
   })
 
-  test('restartSession stops and returns for a wired AA session', async () => {
+  test('restartSession carries on when stopping the old session threw', async () => {
+    const svc = makeSvc()
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    svc.getActiveTransport = vi.fn(() => null)
+    svc.stop = vi.fn(async () => {
+      throw new Error('stop boom')
+    })
+    svc.autoStartIfNeeded = vi.fn(async () => undefined)
+
+    await expect(svc.restartSession()).resolves.toBeUndefined()
+
+    expect(warn).toHaveBeenCalledWith(
+      '[ProjectionService] restartSession: stop threw (ignored)',
+      expect.any(Error)
+    )
+    expect(svc.autoStartIfNeeded).toHaveBeenCalled()
+    warn.mockRestore()
+  })
+
+  test('restartSession leaves the access point alone unless its settings changed', async () => {
+    const svc = makeSvc()
+    svc.cpActive = true
+    const dropSessions = vi.fn()
+    svc.drivers.getCpManager = vi.fn(() => ({
+      dropSessions,
+      helper: { sendReconnectTargets: vi.fn(async () => undefined) }
+    }))
+    svc.getActiveTransport = vi.fn(() => null)
+    svc.stop = vi.fn(async () => undefined)
+    svc.autoStartIfNeeded = vi.fn(async () => undefined)
+    svc.applyConfigPatch({ wifiChannel: 48 })
+
+    await svc.restartSession()
+    expect(restartWifiApMock).not.toHaveBeenCalled()
+
+    svc.config = { ...svc.config, wifiChannel: 149 }
+    const order: string[] = []
+    restartWifiApMock.mockImplementationOnce(async () => {
+      order.push('ap')
+    })
+    dropSessions.mockImplementation(() => order.push('drop'))
+    await svc.restartSession()
+    expect(order).toEqual(['ap', 'drop'])
+
+    restartWifiApMock.mockClear()
+    await svc.restartSession()
+    expect(restartWifiApMock).not.toHaveBeenCalled()
+  })
+
+  test('restartSession has the helper reset a wired AA phone instead of stopping it', async () => {
     const svc = makeSvc()
     svc.getActiveTransport = vi.fn(() => 'aa')
     svc.isActiveAaWired = vi.fn(() => true)
     svc.stop = vi.fn(async () => undefined)
     svc.autoStartIfNeeded = vi.fn(async () => undefined)
     await svc.restartSession()
-    expect(svc.stop).toHaveBeenCalled()
+    expect(bluezMock.restartUsb).toHaveBeenCalled()
+    expect(svc.stop).not.toHaveBeenCalled()
     expect(svc.autoStartIfNeeded).not.toHaveBeenCalled()
+  })
+
+  test('restartSession says so when the helper could not reset the wired phone', async () => {
+    const svc = makeSvc()
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    svc.getActiveTransport = vi.fn(() => 'aa')
+    svc.isActiveAaWired = vi.fn(() => true)
+    svc.stop = vi.fn(async () => undefined)
+
+    bluezMock.restartUsb.mockResolvedValueOnce({ ok: false, error: 'no helper' })
+    await svc.restartSession()
+    expect(warn).toHaveBeenCalledWith('[ProjectionService] restartSession: restart-usb: no helper')
+
+    bluezMock.restartUsb.mockRejectedValueOnce(new Error('socket gone'))
+    await svc.restartSession()
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('restart-usb: Error: socket gone'))
+    expect(svc.stop).not.toHaveBeenCalled()
+    warn.mockRestore()
   })
 
   test('restartSession restarts a wireless AA session', async () => {
@@ -2131,6 +2203,7 @@ describe('ProjectionService active-session, teardown, stop and retry', () => {
 
     await svc.stop()
 
+    expect(send).toHaveBeenCalledWith('projection-event', { type: 'projection', shown: false })
     expect(send).toHaveBeenCalledWith('projection-event', { type: 'unplugged' })
     expect(svc.started).toBe(false)
   })
@@ -3713,7 +3786,7 @@ describe('ProjectionService 100%-coverage fill', () => {
     expect(svc.planes.dispose).toHaveBeenCalled()
   })
 
-  test('onActiveSessionChanged keeps the running decoder when the codec is unchanged', () => {
+  test('onActiveSessionChanged keeps the running decoder for the first session of its codec', () => {
     const svc = makeSvc()
     svc.planes.dispose = vi.fn()
     svc.planes.restoreCodecs = vi.fn()
@@ -3731,8 +3804,63 @@ describe('ProjectionService 100%-coverage fill', () => {
       video: { main: { codec: 'h264' }, cluster: {} }
     }
 
-    svc.onActiveSessionChanged(next, { index: 2 })
+    svc.onActiveSessionChanged(next, null)
 
     expect(svc.planes.dispose).not.toHaveBeenCalled()
+  })
+
+  test('onActiveSessionChanged keeps the running decoder between two sessions of one protocol', () => {
+    const svc = makeSvc()
+    svc.planes.dispose = vi.fn()
+    svc.planes.restoreCodecs = vi.fn()
+    svc.planes.updateMainCrop = vi.fn()
+    svc.planes.getMainCodec = vi.fn(() => 'h265')
+    svc.mediaStore.hydrate = vi.fn()
+    svc.navStore.hydrate = vi.fn()
+    svc.startPromise = null
+    const next = {
+      index: 1,
+      protocol: 'carplay',
+      driver: fakeDriver(),
+      audio: { duckLevel: 1, duckRampMs: 1500 },
+      video: { main: { codec: 'h265' }, cluster: {} }
+    }
+
+    svc.onActiveSessionChanged(next, { index: 2, protocol: 'carplay' })
+
+    expect(svc.planes.dispose).not.toHaveBeenCalled()
+  })
+
+  test('onActiveSessionChanged rebuilds the planes for the other protocol, its feeder held first', () => {
+    const svc = makeSvc()
+    const order: string[] = []
+    svc.planes.dispose = vi.fn(() => order.push('dispose'))
+    svc.planes.restoreCodecs = vi.fn()
+    svc.planes.updateMainCrop = vi.fn()
+    svc.planes.primeMain = vi.fn(() => order.push('primeMain'))
+    svc.planes.primeClusters = vi.fn(() => order.push('primeClusters'))
+    svc.planes.getMainCodec = vi.fn(() => 'h265')
+    svc.mediaStore.hydrate = vi.fn()
+    svc.navStore.hydrate = vi.fn()
+    svc.startPromise = null
+    const prevDriver = { ...fakeDriver(), setVideoActive: vi.fn(() => order.push('hold prev')) }
+    const driver = { ...fakeDriver(), setVideoActive: vi.fn(() => order.push('activate next')) }
+    const prev = { index: 2, protocol: 'carplay', driver: prevDriver, state: 'held' }
+    const next = {
+      index: 1,
+      protocol: 'androidauto',
+      driver,
+      state: 'active',
+      audio: { duckLevel: 1, duckRampMs: 1500 },
+      video: { main: { codec: 'h265' }, cluster: {} }
+    }
+    svc.videoActiveDriver = prevDriver
+    svc.sessions.active = () => next
+
+    svc.onActiveSessionChanged(next, prev)
+
+    expect(order).toEqual(['hold prev', 'activate next', 'dispose', 'primeMain', 'primeClusters'])
+    expect(prevDriver.setVideoActive).toHaveBeenCalledWith(false)
+    expect(driver.setVideoActive).toHaveBeenCalledWith(true)
   })
 })
