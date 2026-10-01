@@ -11,6 +11,7 @@
   h1 { font-size: 22px; font-weight: 600; margin: 0 0 4px; letter-spacing: -0.01em; }
   h1 small { color:var(--dim); font-size: 13px; font-weight: 400; margin-left: 8px; }
   h2 { font-size: 13px; font-weight: 600; color:var(--dim); text-transform: uppercase; letter-spacing: 0.06em; margin: 24px 0 8px; }
+  h2.switched { display:flex; align-items:center; justify-content:space-between; }
   .card { background:var(--card); border:1px solid var(--br); border-radius: 10px; padding: 14px 16px; }
   .kv { display:grid; grid-template-columns: 140px 1fr; gap: 6px 12px; }
   .kv dt { color:var(--dim); }
@@ -63,11 +64,12 @@
       <dt>Load</dt><dd id="load">loading…</dd>
       <dt>Memory</dt><dd id="mem">loading…</dd>
       <dt>USB0 MAC</dt><dd id="mac">loading…</dd>
+      <dt>CP</dt><dd id="cp">loading…</dd>
     </dl>
   </div>
 
-  <h2>WiFi</h2>
-  <div class="card">
+  <h2 class="switched">WiFi <label class="switch"><input type="checkbox" id="wifi-on" aria-label="WiFi on" checked><span class="track"></span></label></h2>
+  <div class="card" id="wifi-card">
     <dl class="kv">
       <dt>SSID</dt><dd id="wifi-ssid">loading…</dd>
       <dt>MAC</dt><dd id="wifi-mac">loading…</dd>
@@ -80,8 +82,8 @@
     </dl>
   </div>
 
-  <h2>Bluetooth</h2>
-  <div class="card">
+  <h2 class="switched">Bluetooth <label class="switch"><input type="checkbox" id="bt-on" aria-label="Bluetooth on" checked><span class="track"></span></label></h2>
+  <div class="card" id="bt-card">
     <dl class="kv">
       <dt>Name</dt><dd id="bt-name">—</dd>
       <dt>MAC</dt><dd id="bt-mac">loading…</dd>
@@ -133,6 +135,37 @@
   </div>
 </main>
 <script>
+// WiFi and Bluetooth switch on the dongle and stay so across a boot. Off folds the section away.
+const radios = {
+  wifi: { label: 'WiFi', input: document.getElementById('wifi-on'), card: document.getElementById('wifi-card'), busy: false },
+  bt: { label: 'Bluetooth', input: document.getElementById('bt-on'), card: document.getElementById('bt-card'), busy: false },
+};
+function showRadio(name, enabled) {
+  const r = radios[name];
+  if (r.busy || typeof enabled !== 'boolean') return;
+  r.input.checked = enabled;
+  r.card.hidden = !enabled;
+}
+for (const [name, r] of Object.entries(radios)) {
+  r.input.addEventListener('change', async () => {
+    const on = r.input.checked;
+    r.busy = true;
+    r.input.disabled = true;
+    r.card.hidden = !on;
+    try {
+      const res = await fetch('/api/' + name, { method: 'POST', body: JSON.stringify({ enabled: on ? 1 : 0 }) });
+      if (!res.ok) throw new Error((await res.json()).error || res.status);
+    } catch (e) {
+      r.input.checked = !on;
+      r.card.hidden = on;
+      say(`could not switch ${r.label} ${on ? 'on' : 'off'}: ${e.message || e}`, 'err');
+    } finally {
+      r.busy = false;
+      r.input.disabled = false;
+    }
+  });
+}
+
 // Previous wifi byte sample, so /api/wifi's counters become a throughput between polls.
 let wifiPrev = null;
 async function tick() {
@@ -140,7 +173,7 @@ async function tick() {
     const r = await fetch('/api/status');
     if (r.ok) {
       const s = await r.json();
-      for (const k of ['model','kernel','uptime','load','mem','mac']) document.getElementById(k).textContent = s[k];
+      for (const k of ['model','kernel','uptime','load','mem','mac','cp']) document.getElementById(k).textContent = s[k];
       document.getElementById('firmware').textContent = `${s.version} (${s.build})`;
       installed = { target: s.target, version: s.version, build: s.build };
     }
@@ -149,6 +182,7 @@ async function tick() {
     const r = await fetch('/api/bt');
     if (r.ok) {
       const b = await r.json();
+      showRadio('bt', b.enabled);
       document.getElementById('bt-name').textContent = b.name || '—';
       document.getElementById('bt-mac').textContent = b.mac || '—';
       document.getElementById('bt-state').textContent = b.state || '—';
@@ -158,6 +192,7 @@ async function tick() {
     const r = await fetch('/api/wifi');
     if (r.ok) {
       const w = await r.json();
+      showRadio('wifi', w.enabled);
       document.getElementById('wifi-ssid').textContent = w.ssid || '—';
       document.getElementById('wifi-mac').textContent = w.mac || '—';
       document.getElementById('wifi-band').textContent = w.band || '—';
@@ -184,28 +219,16 @@ const ledBri   = document.getElementById('led-brightness');
 const ledBriV  = document.getElementById('led-brightness-val');
 const ledMsg = document.getElementById('status-msg');
 
-// Which sections this dongle offers. flash is an object of the writes it supports:
-// mtd (a .lfwb bundle), stack (upload the .gz), rootfs (restore a full image).
+// Which sections this dongle offers. flash.mtd: it takes a .lfwb bundle.
 let CAPS = { flash: {}, led: false };
 (async () => {
   try {
     CAPS = await (await fetch('/api/caps')).json();
     if (CAPS.led) document.getElementById('sec-led').hidden = false;
-    const f = CAPS.flash || {};
-    if (f.mtd || f.stack || f.rootfs) {
+    if ((CAPS.flash || {}).mtd) {
       document.getElementById('sec-flash').hidden = false;
-      const slot = document.getElementById('flash-slot');
-      const name = document.getElementById('flash-name');
-      if (f.stack || f.rootfs) {
-        const bits = [];
-        if (f.stack)  bits.push('.gz firmware update');
-        if (f.rootfs) bits.push('.img firmware restore');
-        slot.textContent = 'firmware';
-        name.textContent = bits.join(' · ');
-      } else {
-        slot.textContent = '.lfwb';
-        name.textContent = 'firmware bundle';
-      }
+      document.getElementById('flash-slot').textContent = '.lfwb';
+      document.getElementById('flash-name').textContent = 'firmware bundle';
     }
   } catch {}
 })();
@@ -257,7 +280,7 @@ function say(txt, cls) {
 const bar = document.getElementById('status-progress');
 function fmtKB(n) { return (n/1024).toFixed(0) + ' KiB'; }
 
-async function flashFile(file, sha) {
+async function flashFile(file) {
   say(`Uploading ${fmtKB(file.size)}…`);
   bar.hidden = false; bar.value = 0;
 
@@ -319,21 +342,8 @@ async function flashFile(file, sha) {
   });
   xhr.addEventListener('error', () => { bar.hidden = true; say('network error during upload', 'err'); });
   xhr.addEventListener('abort', () => { bar.hidden = true; say('upload aborted', 'err'); });
-  // One endpoint; the dongle routes by the file. A .lfwb bundle and a gzipped stack carry their
-  // own integrity, a raw rootfs image does not — so the browser hashes that and the dongle rechecks.
-  const head = new Uint8Array(await file.slice(0, 4).arrayBuffer());
-  const selfChecked = (head[0] === 0x1f && head[1] === 0x8b) ||
-                      (head[0] === 0x4c && head[1] === 0x46 && head[2] === 0x57 && head[3] === 0x42);
-  let url = sha ? '/api/flash?sha=' + sha : '/api/flash';
-  if (!sha && !selfChecked) {
-    say('Hashing image…');
-    try {
-      const dig = await crypto.subtle.digest('SHA-256', await file.arrayBuffer());
-      const sha = [...new Uint8Array(dig)].map(b => b.toString(16).padStart(2, '0')).join('');
-      url = '/api/flash?sha=' + sha;
-    } catch (e) { bar.hidden = true; say('sha256 failed: ' + e, 'err'); return; }
-  }
-  xhr.open('POST', url);
+  // The bundle carries a CRC per image, the dongle checks them before it writes anything.
+  xhr.open('POST', '/api/flash');
   xhr.setRequestHeader('Content-Type', 'application/octet-stream');
   xhr.send(file);
 }
@@ -439,7 +449,7 @@ otaInstall.addEventListener('click', async () => {
       const sha = [...new Uint8Array(dig)].map(b => b.toString(16).padStart(2, '0')).join('');
       if (sha !== fw.sha256) throw new Error('download does not match its sha256');
     }
-    await flashFile(blob, fw.sha256);
+    await flashFile(blob);
   } catch (e) {
     say('update failed: ' + (e.message || e), 'err');
   } finally {

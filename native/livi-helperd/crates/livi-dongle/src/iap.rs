@@ -39,14 +39,14 @@ static CARRIED: std::sync::Mutex<Vec<std::os::fd::OwnedFd>> = std::sync::Mutex::
 
 /// Keeps a second handle on this socket, and lets go of the ones that have ended.
 fn carry(stream: &TcpStream) {
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    let copy = unsafe { libc::dup(stream.as_raw_fd()) };
-    if copy < 0 {
+    use std::os::fd::AsFd;
+    // A plain dup() is inherited by every child we start, which then holds the dongle's session.
+    let Ok(copy) = stream.as_fd().try_clone_to_owned() else {
         return;
-    }
+    };
     let mut carried = CARRIED.lock().unwrap();
     carried.retain(alive);
-    carried.push(unsafe { OwnedFd::from_raw_fd(copy) });
+    carried.push(copy);
 }
 
 /// Whether anything still runs on this socket. A peek takes nothing away from the session.
@@ -110,12 +110,9 @@ pub fn sessions(ready: impl Fn() -> bool + Send + 'static) -> mpsc::Receiver<Ses
 
 /// Holds a connection open until the dongle says a phone is on it.
 async fn waiting() -> Result<Session, String> {
-    let mut stream = TcpStream::connect(link::addr(PORT))
-        .await
-        .map_err(|e| format!("dongle: {e}"))?;
-    stream
-        .set_nodelay(true)
-        .map_err(|e| format!("nodelay: {e}"))?;
+    let mut stream =
+        TcpStream::connect(link::addr(PORT)).await.map_err(|e| format!("dongle: {e}"))?;
+    stream.set_nodelay(true).map_err(|e| format!("nodelay: {e}"))?;
     // Waiting for a phone means a long silence, so the link itself has to say when the dongle is
     // gone. Without this a restarted dongle leaves us listening to nobody.
     watch_liveness(&stream);
@@ -132,11 +129,7 @@ async fn waiting() -> Result<Session, String> {
         .and_then(address)
         .ok_or("the dongle named no controller")?;
     println!("[iap] {peer} is on the dongle's bluetooth");
-    Ok(Session {
-        peer,
-        local,
-        stream,
-    })
+    Ok(Session { peer, local, stream })
 }
 
 /// Asks the kernel to check a quiet link, so a dongle that went away is noticed within seconds.
@@ -202,22 +195,12 @@ async fn read_line(stream: &mut TcpStream) -> Result<String, String> {
 /// One order to the dongle's accessory, and the line it answers with.
 fn order(line: &str) -> Result<(), String> {
     use std::io::{BufRead, BufReader, Write as _};
-    use std::net::ToSocketAddrs;
-    let addr = (link::LINK_NAME, CONTROL_PORT)
-        .to_socket_addrs()
-        .map_err(|e| format!("dongle: {e}"))?
-        .next()
-        .ok_or("the dongle has no address")?;
-    let mut stream = std::net::TcpStream::connect_timeout(&addr, ORDER_TIMEOUT)
+    let mut stream = livi_net::connect((link::LINK_NAME, CONTROL_PORT), ORDER_TIMEOUT)
         .map_err(|e| format!("dongle: {e}"))?;
-    stream
-        .set_read_timeout(Some(ORDER_TIMEOUT))
-        .map_err(|e| format!("dongle: {e}"))?;
+    stream.set_read_timeout(Some(ORDER_TIMEOUT)).map_err(|e| format!("dongle: {e}"))?;
     writeln!(stream, "{line}").map_err(|e| format!("dongle: {e}"))?;
     let mut answer = String::new();
-    BufReader::new(&stream)
-        .read_line(&mut answer)
-        .map_err(|e| format!("dongle: {e}"))?;
+    BufReader::new(&stream).read_line(&mut answer).map_err(|e| format!("dongle: {e}"))?;
     match answer.trim() {
         "ok" => Ok(()),
         other => Err(other.trim_start_matches("error ").to_string()),
@@ -241,10 +224,7 @@ mod tests {
 
     #[test]
     fn an_address_reads_back_the_way_the_wire_carries_it() {
-        assert_eq!(
-            address("38:BA:B0:A0:E6:6F"),
-            Some([0x6f, 0xe6, 0xa0, 0xb0, 0xba, 0x38])
-        );
+        assert_eq!(address("38:BA:B0:A0:E6:6F"), Some([0x6f, 0xe6, 0xa0, 0xb0, 0xba, 0x38]));
         assert_eq!(address("38:BA:B0:A0:E6"), None);
         assert_eq!(address("38:BA:B0:A0:E6:6F:11"), None);
         assert_eq!(address("not an address"), None);

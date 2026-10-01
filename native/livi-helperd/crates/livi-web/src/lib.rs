@@ -1,7 +1,7 @@
-//! livi-web — the dongle web UI + control API, shared by both dongles (V821B/riscv32 and
-//! cpc200/i.MX6). The page and the HTTP server are identical; only the hardware-specific parts
-//! differ and come in as `WebCaps` from each dongle's binary: which interfaces to read, whether
-//! a controllable LED is present, and how a flash write is actually performed.
+//! livi-web — the dongle web UI + control API, shared by every LIVI Link board (V821B, AX520,
+//! i.MX6UL). The page and the HTTP server are identical; only the hardware-specific parts differ
+//! and come in as `WebCaps` from livid: which interfaces to read, whether a controllable LED is
+//! present, and how a flash write is actually performed.
 //!
 //! Routes: GET / (index.html), GET /api/{status,wifi,bt,led,caps,flash/status},
 //! POST /api/{led,flash,reboot}. The flash + led routes answer 404 when the caps disable them.
@@ -11,40 +11,44 @@ use std::sync::OnceLock;
 /// The firmware writes this dongle offers; several can be live at once. Default is none.
 #[derive(Default)]
 pub struct Flash {
-    /// A `.lfwb` bundle written across NOR mtd partitions, magic-checked and CRC-compared.
-    pub mtd: bool,
-    /// Update the running stack from its gzipped binary — no partition erase.
-    pub stack: Option<Stack>,
-    /// Restore a full rootfs image (e.g. the stock firmware backup), sha256- and size-gated.
-    pub rootfs: Option<Rootfs>,
+    /// The partitions a `.lfwb` bundle is written to, magic-checked and CRC-compared. Empty when
+    /// this dongle takes no bundle.
+    pub mtd: Vec<MtdSlot>,
+    /// Run after a bundle is written and verified. If it fails the dongle does not reboot.
+    pub check: Option<String>,
 }
 
-/// Where the stack `.gz` lands on jffs2 and how the launcher is re-run to pick it up.
-pub struct Stack {
-    pub install_to: String,
-    pub restart: String,
+/// One bundle image type and where it goes. The size is the partition's: a larger payload would
+/// run into the next one.
+pub struct MtdSlot {
+    pub typ: u8,
+    pub node: String,
+    pub magic: Vec<u8>,
+    pub size: u64,
+    /// For a partition the bootloader does not take the image for as it is.
+    pub stage: Option<Stage>,
+    /// Runs before a changed image is written, nothing is written when it fails.
+    pub before_write: Option<fn() -> Result<(), String>>,
 }
 
-/// The flash script and the partition it writes.
-pub struct Rootfs {
-    pub script: String,
-    pub partition: String,
-}
+/// Builds what goes on a partition from the image and what the partition holds now.
+pub type Stage = fn(&[u8], &[u8]) -> Result<Vec<u8>, String>;
 
 /// What differs between the dongles the shared server runs on.
 pub struct WebCaps {
-    /// Human label shown in the Device card, e.g. "CPC200-CCPA" or "V821B + AIC8800D80".
+    /// Human label shown in the Device card, e.g. "i.MX6ULL + IW416" or "V821B + AIC8800D80".
     pub model: String,
     /// The directory under assets/livi-link this dongle's firmware is published in.
     pub target: String,
     pub port: u16,
     /// The AP interface whose SSID/MAC/rates the WiFi card shows (e.g. "wlan0").
     pub wifi_iface: String,
-    /// The bridge whose forwarding table names the AP's clients; None counts via nl80211
-    /// (the cpc200 bridges with l2fwd and has no br0).
+    /// The bridge whose forwarding table names the AP's clients; None counts them via nl80211.
     pub bridge: Option<String>,
     /// The host-facing interface whose MAC stands in as the dongle's address.
     pub host_iface: String,
+    /// Where mfid notes the MFi coprocessor it found.
+    pub mfi: String,
     /// The Bluetooth controller (e.g. "hci0").
     pub bt: String,
     /// Whether to offer the LED section (a controllable LED daemon is present).
@@ -88,16 +92,11 @@ use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
+use livi_wifi::radio::{self, Radio};
+
 // Kept under web/ (not assets/): the Mac↔build-host sync skips any assets/ directory, which
 // would leave the build host compiling a stale or missing page.
 const INDEX_HTML: &str = include_str!("../web/index.html");
-
-// mtd slot sizes must match the on-flash partition layout. If a flash payload
-// exceeds the slot, refuse — the write would corrupt the neighbouring partition.
-const MTD1_SIZE: u64 = 0x0031_0000; // 3.06 MiB — kernel + DTB bootimg
-const MTD3_SIZE: u64 = 0x0048_0000; // 4.5  MiB — squashfs rootfs
-// mtd0 (u-boot + OpenSBI) is intentionally NOT in this table. We never flash it
-// from a running system; a bad write there requires FEL recovery.
 
 fn serve_forever() -> std::io::Result<()> {
     let port = caps().port;
@@ -105,11 +104,15 @@ fn serve_forever() -> std::io::Result<()> {
     let listener = TcpListener::bind(SocketAddr::V6(addr))?;
     eprintln!("[livi-httpd] listening on [::]:{port} (dual-stack)");
 
-    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN); }
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
 
     for conn in listener.incoming() {
         match conn {
-            Ok(s) => { thread::spawn(|| handle(s)); }
+            Ok(s) => {
+                thread::spawn(|| handle(s));
+            }
             Err(e) => eprintln!("[livi-httpd] accept: {e}"),
         }
     }
@@ -133,16 +136,20 @@ fn read_request(sock: &TcpStream) -> Option<(String, String, u64, Option<Vec<u8>
 
     let mut first = String::new();
     reader.read_line(&mut first).ok()?;
-    if first.is_empty() { return None; }
+    if first.is_empty() {
+        return None;
+    }
     let mut parts = first.split_whitespace();
     let method = parts.next()?.to_string();
-    let path   = parts.next()?.to_string();
+    let path = parts.next()?.to_string();
 
     let mut content_length: u64 = 0;
     loop {
         let mut line = String::new();
         let n = reader.read_line(&mut line).ok()?;
-        if n <= 2 { break; } // empty CRLF terminates headers
+        if n <= 2 {
+            break;
+        } // empty CRLF terminates headers
         let lower = line.to_ascii_lowercase();
         if let Some(v) = lower.strip_prefix("content-length:") {
             content_length = v.trim().parse().unwrap_or(0);
@@ -153,17 +160,21 @@ fn read_request(sock: &TcpStream) -> Option<(String, String, u64, Option<Vec<u8>
         let mut buf = vec![0u8; content_length as usize];
         reader.read_exact(&mut buf).ok()?;
         Some(buf)
-    } else { None };
+    } else {
+        None
+    };
 
     Some((method, path, content_length, body))
 }
 
-fn route(rmethod: &str, rpath: &str, body: Option<&[u8]>, clen: u64)
-    -> (&'static str, &'static str, Vec<u8>)
-{
+fn route(
+    rmethod: &str,
+    rpath: &str,
+    body: Option<&[u8]>,
+    clen: u64,
+) -> (&'static str, &'static str, Vec<u8>) {
     let c = caps();
-    // The path may carry a query (?sha=… for the rootfs flash); match on the path, keep the query.
-    let (path, query) = rpath.split_once('?').unwrap_or((rpath, ""));
+    let path = rpath.split_once('?').map_or(rpath, |(p, _)| p);
     let method = rmethod;
 
     // LED section only when a controllable LED daemon is present.
@@ -174,135 +185,66 @@ fn route(rmethod: &str, rpath: &str, body: Option<&[u8]>, clen: u64)
             _ => {}
         }
     }
-    // One upload endpoint; the dongle picks the write from what it offers and what the file is.
-    let has_flash = c.flash.mtd || c.flash.stack.is_some() || c.flash.rootfs.is_some();
-    if has_flash && (method, path) == ("POST", "/api/flash") {
-        return flash_dispatch(c, query, body, clen);
+    if !c.flash.mtd.is_empty() && (method, path) == ("POST", "/api/flash") {
+        return flash_dispatch(c, body, clen);
     }
-    if c.flash.mtd {
-        match (method, path) {
-            ("POST", "/api/flash/mtd1") => return flash("mtdblock1", MTD1_SIZE, b"ANDROID!", body, clen),
-            ("POST", "/api/flash/mtd3") => return flash("mtdblock3", MTD3_SIZE, b"hsqs", body, clen),
-            _ => {}
+    if method == "POST" {
+        let typ = path.strip_prefix("/api/flash/mtd").and_then(|n| n.parse::<u8>().ok());
+        if let Some(slot) = typ.and_then(|t| c.flash.mtd.iter().find(|s| s.typ == t)) {
+            if slot.stage.is_some() || slot.before_write.is_some() {
+                return (
+                    S_400,
+                    T_JSON,
+                    err_json(&format!("{} takes its image only from a bundle", slot.node)),
+                );
+            }
+            return flash(&c.flash, slot, body, clen);
         }
     }
 
     match (method, path) {
         ("GET", "/") | ("GET", "/index.html") => (S_200, T_HTML, INDEX_HTML.as_bytes().to_vec()),
         ("GET", "/api/status") => (S_200, T_JSON, status_json().into_bytes()),
-        ("GET", "/api/wifi")   => (S_200, T_JSON, wifi_json().into_bytes()),
-        ("GET", "/api/bt")     => (S_200, T_JSON, bt_json().into_bytes()),
-        ("GET", "/api/caps")   => (S_200, T_JSON, caps_json().into_bytes()),
+        ("GET", "/api/wifi") => (S_200, T_JSON, wifi_json().into_bytes()),
+        ("POST", "/api/wifi") => switch_radio(body, Radio::Wifi),
+        ("GET", "/api/bt") => (S_200, T_JSON, bt_json().into_bytes()),
+        ("POST", "/api/bt") => switch_radio(body, Radio::Bt),
+        ("GET", "/api/caps") => (S_200, T_JSON, caps_json().into_bytes()),
         ("GET", "/api/flash/status") => (S_200, T_JSON, flash_status_json().into_bytes()),
         ("GET", "/api/update") => (S_200, T_JSON, update_json().into_bytes()),
         ("POST", "/api/update") => set_update(body),
-        ("POST", "/api/reboot")    => reboot_soon(),
+        ("POST", "/api/reboot") => reboot_soon(),
         _ => (S_404, T_TEXT, b"not found\n".to_vec()),
     }
 }
 
-/// What the page shows: which sections are live and which firmware writes this dongle offers.
+/// What the page shows: which sections are live and whether this dongle takes firmware.
 fn caps_json() -> String {
-    let f = &caps().flash;
-    format!(
-        r#"{{"flash":{{"mtd":{},"stack":{},"rootfs":{}}},"led":{}}}"#,
-        f.mtd, f.stack.is_some(), f.rootfs.is_some(), caps().led
-    )
+    format!(r#"{{"flash":{{"mtd":{}}},"led":{}}}"#, !caps().flash.mtd.is_empty(), caps().led)
 }
 
-/// cpc200/i.MX6 flash: write the uploaded rootfs image to a staging file, then hand it to
-/// flash-image.sh with the client-supplied sha256, which re-checks size + hash before it erases.
-/// No FEL here, so the script is the guard — we never write the partition ourselves.
-fn flash_rootfs(script: &str, partition: &str, query: &str, body: Option<&[u8]>, clen: u64)
-    -> (&'static str, &'static str, Vec<u8>)
-{
-    let Some(data) = body else { return (S_400, T_JSON, err_json("empty body")); };
-    if clen == 0 || (data.len() as u64) != clen {
-        return (S_400, T_JSON, err_json("content-length mismatch"));
+/// The single upload endpoint takes a `.lfwb` bundle.
+fn flash_dispatch(
+    c: &WebCaps,
+    body: Option<&[u8]>,
+    clen: u64,
+) -> (&'static str, &'static str, Vec<u8>) {
+    let Some(data) = body else {
+        return (S_400, T_JSON, err_json("empty body"));
+    };
+    if data.starts_with(BUNDLE_MAGIC) {
+        return flash_bundle(&c.flash, body, clen);
     }
-    let sha = query.split('&').find_map(|kv| kv.strip_prefix("sha=")).unwrap_or("");
-    if sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return (S_400, T_JSON, err_json("missing/!64-hex ?sha= — refusing an unguarded flash"));
-    }
-    let img = "/tmp/restore.img";
-    if let Err(e) = fs::write(img, data) {
-        return (S_500, T_JSON, err_json(&format!("stage {img}: {e}")));
-    }
-    let _ = fs::create_dir_all("/tmp/livi/led");
-    let _ = fs::write("/tmp/livi/led/flash-mode", b"");
-    // flash-image.sh stages its own tools to tmpfs, blinks, writes, verifies and reboots.
-    match Command::new("/bin/sh").arg(script).arg(partition).arg(sha).arg(img).spawn() {
-        Ok(_) => (S_200, T_JSON, ok_json(&format!(
-            "flashing {partition} via {script}; the dongle reboots on success"
-        ))),
-        Err(e) => {
-            let _ = fs::remove_file("/tmp/livi/led/flash-mode");
-            (S_500, T_JSON, err_json(&format!("spawn {script}: {e}")))
-        }
-    }
+    (S_400, T_JSON, err_json("not a LIVI Link firmware bundle (.lfwb)"))
 }
 
-/// Stack update: the uploaded gzip is the relay-stack binary. Write it to its home on jffs2, then
-/// re-run the launcher so it unpacks and relinks — no partition erase, no full reboot.
-fn flash_stack(install_to: &str, restart: &str, query: &str, body: Option<&[u8]>, clen: u64)
-    -> (&'static str, &'static str, Vec<u8>)
-{
-    let Some(data) = body else { return (S_400, T_JSON, err_json("empty body")); };
-    if clen == 0 || (data.len() as u64) != clen {
-        return (S_400, T_JSON, err_json("content-length mismatch"));
-    }
-    if data.len() < 512 || !data.starts_with(&[0x1f, 0x8b]) {
-        return (S_400, T_JSON, err_json("not a gzip — expected the stack .gz"));
-    }
-    let _ = fs::create_dir_all("/tmp/livi/led");
-    let _ = fs::write("/tmp/livi/led/flash-mode", b"");
-    // Write beside the target and rename, so the launcher never sees a half-written file.
-    let tmp = format!("{install_to}.new");
-    if let Err(e) = write_sync(&tmp, data) {
-        let _ = fs::remove_file("/tmp/livi/led/flash-mode");
-        return (S_500, T_JSON, err_json(&format!("write {tmp}: {e}")));
-    }
-    // A stack that does not unpack leaves a dongle with no web UI to fix it from.
-    if let Some(want) = query.split('&').find_map(|kv| kv.strip_prefix("sha=")) {
-        let got = Command::new("sha256sum").arg(&tmp).output().ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .and_then(|s| s.split_whitespace().next().map(str::to_owned));
-        if got.as_deref() != Some(want) {
-            let _ = fs::remove_file(&tmp);
-            let _ = fs::remove_file("/tmp/livi/led/flash-mode");
-            return (S_400, T_JSON, err_json("sha256 mismatch, nothing installed"));
-        }
-    }
-    if let Err(e) = fs::rename(&tmp, install_to) {
-        let _ = fs::remove_file("/tmp/livi/led/flash-mode");
-        return (S_500, T_JSON, err_json(&format!("install {install_to}: {e}")));
-    }
-    // The restart takes this httpd down with it, so the response must go out first.
-    restart_after(Duration::from_millis(500), restart.to_string());
-    (S_200, T_JSON, ok_json(&format!("installed {} B; restarting the stack", data.len())))
-}
-
-/// The single upload endpoint: routes by what this dongle offers and what the file is — a `.lfwb`
-/// bundle ("LFWB"), a gzipped stack (1f 8b), else a full rootfs image.
-fn flash_dispatch(c: &WebCaps, query: &str, body: Option<&[u8]>, clen: u64)
-    -> (&'static str, &'static str, Vec<u8>)
-{
-    let Some(data) = body else { return (S_400, T_JSON, err_json("empty body")); };
-    if c.flash.mtd && data.starts_with(BUNDLE_MAGIC) {
-        return flash_bundle(body, clen);
-    }
-    if let Some(s) = c.flash.stack.as_ref().filter(|_| data.starts_with(&[0x1f, 0x8b])) {
-        return flash_stack(&s.install_to, &s.restart, query, body, clen);
-    }
-    if let Some(r) = &c.flash.rootfs {
-        return flash_rootfs(&r.script, &r.partition, query, body, clen);
-    }
-    (S_400, T_JSON, err_json("this upload matches no firmware this dongle can write"))
-}
-
-fn flash(node: &str, slot_size: u64, magic: &[u8], body: Option<&[u8]>, clen: u64)
-    -> (&'static str, &'static str, Vec<u8>)
-{
+fn flash(
+    f: &Flash,
+    slot: &MtdSlot,
+    body: Option<&[u8]>,
+    clen: u64,
+) -> (&'static str, &'static str, Vec<u8>) {
+    let (node, slot_size, magic) = (slot.node.as_str(), slot.size, slot.magic.as_slice());
     let Some(data) = body else {
         return (S_400, T_JSON, err_json("empty body"));
     };
@@ -310,9 +252,11 @@ fn flash(node: &str, slot_size: u64, magic: &[u8], body: Option<&[u8]>, clen: u6
         return (S_400, T_JSON, err_json("content-length mismatch"));
     }
     if data.len() as u64 > slot_size {
-        return (S_400, T_JSON, err_json(&format!(
-            "payload {} B exceeds {} slot ({} B)", data.len(), node, slot_size
-        )));
+        return (
+            S_400,
+            T_JSON,
+            err_json(&format!("payload {} B exceeds {} slot ({} B)", data.len(), node, slot_size)),
+        );
     }
     if data.len() < 512 {
         return (S_400, T_JSON, err_json("payload absurdly small — refusing"));
@@ -324,25 +268,29 @@ fn flash(node: &str, slot_size: u64, magic: &[u8], body: Option<&[u8]>, clen: u6
     // structurally plausible.
     if !data.starts_with(magic) {
         let want = String::from_utf8_lossy(magic).to_string();
-        let got: String = data.iter().take(magic.len())
+        let got: String = data
+            .iter()
+            .take(magic.len())
             .map(|b| if b.is_ascii_graphic() || *b == b' ' { *b as char } else { '.' })
             .collect();
-        return (S_400, T_JSON, err_json(&format!(
-            "payload magic mismatch for /dev/{node}: expected {:?}, got {:?} — refusing",
-            want, got
-        )));
+        return (
+            S_400,
+            T_JSON,
+            err_json(&format!(
+                "payload magic mismatch for /dev/{node}: expected {:?}, got {:?} — refusing",
+                want, got
+            )),
+        );
     }
 
-    // Tell livi-ledd we're flashing → red/blue alternating blink.
-    // Cleared on any failure below; reboot itself clears the whole tmpfs.
-    let _ = fs::create_dir_all("/tmp/livi/led");
-    let _ = fs::write("/tmp/livi/led/flash-mode", b"");
+    // Tell livi-ledd we're flashing → red/blue alternating blink, until the write is verified.
+    led_flash_running();
 
     // Write, then fsync so the block driver commits the NOR erase+program.
     let path = format!("/dev/{node}");
     write_progress(node, 0, data.len(), "write");
     if let Err(e) = write_chunked(&path, data, node) {
-        let _ = fs::remove_file("/tmp/livi/led/flash-mode");
+        led_flash_error();
         write_progress(node, 0, data.len(), "error");
         return (S_500, T_JSON, err_json(&format!("write /dev/{node}: {e}")));
     }
@@ -352,20 +300,32 @@ fn flash(node: &str, slot_size: u64, magic: &[u8], body: Option<&[u8]>, clen: u6
     // partition in whatever state it is in (bricked), but at least we do
     // NOT reboot into it — the caller learns and can FEL-recover instead.
     write_progress(node, data.len(), data.len(), "verify");
-    match verify_flash(&path, data) {
+    match verify_flash(&raw_mtd(node), data) {
         Ok(()) => {
+            if let Err(e) = post_write_check(f) {
+                led_flash_error();
+                write_progress(node, data.len(), data.len(), "error");
+                return (S_500, T_JSON, err_json(&e));
+            }
             write_progress(node, data.len(), data.len(), "done");
+            led_flash_done();
             reboot_after(Duration::from_millis(500));
-            (S_200, T_JSON, ok_json(&format!(
-                "wrote {} B to /dev/{node}, verified, rebooting", data.len()
-            )))
+            (
+                S_200,
+                T_JSON,
+                ok_json(&format!("wrote {} B to /dev/{node}, verified, rebooting", data.len())),
+            )
         }
         Err(e) => {
-            let _ = fs::remove_file("/tmp/livi/led/flash-mode");
+            led_flash_error();
             write_progress(node, data.len(), data.len(), "error");
-            (S_500, T_JSON, err_json(&format!(
-                "verify /dev/{node} failed after write: {e} — DO NOT reboot, use FEL to restore"
-            )))
+            (
+                S_500,
+                T_JSON,
+                err_json(&format!(
+                    "verify /dev/{node} failed after write: {e} — DO NOT reboot, use FEL to restore"
+                )),
+            )
         }
     }
 }
@@ -374,7 +334,7 @@ fn flash(node: &str, slot_size: u64, magic: &[u8], body: Option<&[u8]>, clen: u6
 // Firmware bundle (.lfwb): a single file carrying mtd1 + mtd3 (and future
 // slots). On upload the dongle keeps the whole thing in RAM, then for each
 // image compares CRC32 against what's currently on that partition and only
-// writes if it actually differs. See scripts/livi-link/pack-bundle.sh.
+// writes if it actually differs. See scripts/livi-link/common/pack-bundle.sh.
 // ---------------------------------------------------------------------------
 
 const BUNDLE_MAGIC: &[u8; 4] = b"LFWB";
@@ -390,7 +350,11 @@ struct ImageDesc {
     payload_offset: usize,
 }
 
-fn flash_bundle(body: Option<&[u8]>, clen: u64) -> (&'static str, &'static str, Vec<u8>) {
+fn flash_bundle(
+    f: &Flash,
+    body: Option<&[u8]>,
+    clen: u64,
+) -> (&'static str, &'static str, Vec<u8>) {
     let Some(data) = body else {
         return (S_400, T_JSON, err_json("empty body"));
     };
@@ -422,12 +386,16 @@ fn flash_bundle(body: Option<&[u8]>, clen: u64) -> (&'static str, &'static str, 
         let off = BUNDLE_HDR_LEN + i * BUNDLE_DESC_LEN;
         let typ = data[off];
         let flags = data[off + 1];
-        let length = u32::from_le_bytes([data[off + 4], data[off + 5], data[off + 6], data[off + 7]]);
-        let crc = u32::from_le_bytes([data[off + 8], data[off + 9], data[off + 10], data[off + 11]]);
+        let length =
+            u32::from_le_bytes([data[off + 4], data[off + 5], data[off + 6], data[off + 7]]);
+        let crc =
+            u32::from_le_bytes([data[off + 8], data[off + 9], data[off + 10], data[off + 11]]);
         if cursor + length as usize > data.len() {
-            return (S_400, T_JSON, err_json(&format!(
-                "bundle payload short for image {} (type {})", i, typ
-            )));
+            return (
+                S_400,
+                T_JSON,
+                err_json(&format!("bundle payload short for image {} (type {})", i, typ)),
+            );
         }
         descs.push(ImageDesc { typ, _flags: flags, length, crc32: crc, payload_offset: cursor });
         cursor += length as usize;
@@ -435,81 +403,221 @@ fn flash_bundle(body: Option<&[u8]>, clen: u64) -> (&'static str, &'static str, 
 
     // Verify payload CRCs match what the descriptors promise.
     for (i, d) in descs.iter().enumerate() {
-        let slice = &data[d.payload_offset .. d.payload_offset + d.length as usize];
+        let slice = &data[d.payload_offset..d.payload_offset + d.length as usize];
         if crc32(slice) != d.crc32 {
-            return (S_400, T_JSON, err_json(&format!(
-                "bundle image {} (type {}) CRC mismatch — corrupt upload", i, d.typ
-            )));
+            return (
+                S_400,
+                T_JSON,
+                err_json(&format!(
+                    "bundle image {} (type {}) CRC mismatch — corrupt upload",
+                    i, d.typ
+                )),
+            );
         }
     }
 
-    // Signal LED flash-mode across the whole operation.
-    let _ = fs::create_dir_all("/tmp/livi/led");
-    let _ = fs::write("/tmp/livi/led/flash-mode", b"");
+    // Every image is checked before the first one is written. A bundle this dongle cannot take in full (a type it has
+    // no slot for, an image too big, a wrong header, one that does not stage) must not leave the flash half rewritten.
+    let mut staged: Vec<Option<Vec<u8>>> = Vec::with_capacity(descs.len());
+    for d in descs.iter() {
+        let Some(slot) = f.mtd.iter().find(|s| s.typ == d.typ) else {
+            return (
+                S_400,
+                T_JSON,
+                err_json(&format!("image type {} is not for this dongle, nothing written", d.typ)),
+            );
+        };
+        let slice = &data[d.payload_offset..d.payload_offset + d.length as usize];
+        if (d.length as u64) > slot.size {
+            return (
+                S_400,
+                T_JSON,
+                err_json(&format!(
+                    "image type {} ({}) is {} B, exceeds slot {} B, nothing written",
+                    d.typ, slot.node, d.length, slot.size
+                )),
+            );
+        }
+        if !slice.starts_with(slot.magic.as_slice()) {
+            return (
+                S_400,
+                T_JSON,
+                err_json(&format!(
+                    "image type {} payload magic mismatch for {}, nothing written",
+                    d.typ, slot.node
+                )),
+            );
+        }
+        let Some(stage) = slot.stage else {
+            staged.push(None);
+            continue;
+        };
+        let raw = raw_mtd(&slot.node);
+        match fs::read(&raw)
+            .map_err(|e| format!("read {raw}: {e}"))
+            .and_then(|now| stage(slice, &now))
+        {
+            Ok(part) => staged.push(Some(part)),
+            Err(e) => {
+                return (
+                    S_400,
+                    T_JSON,
+                    err_json(&format!(
+                        "image type {} for {}: {e}, nothing written",
+                        d.typ, slot.node
+                    )),
+                );
+            }
+        }
+    }
+
+    // Signal LED flash-mode across the whole operation: red and blue alternating until the last image is verified.
+    led_flash_running();
 
     // Walk images: skip if the on-flash content already matches, else write+verify.
     let mut wrote_any = false;
     let mut report: Vec<String> = Vec::new();
-    for d in descs.iter() {
-        let (node, magic, slot_size) = match d.typ {
-            1 => ("mtdblock1", &b"ANDROID!"[..], MTD1_SIZE),
-            3 => ("mtdblock3", &b"hsqs"[..],     MTD3_SIZE),
-            other => {
-                let _ = fs::remove_file("/tmp/livi/led/flash-mode");
-                return (S_400, T_JSON, err_json(&format!("unknown image type {}", other)));
-            }
+    for (d, staged) in descs.iter().zip(&staged) {
+        let Some(slot) = f.mtd.iter().find(|s| s.typ == d.typ) else {
+            led_flash_error();
+            return (
+                S_400,
+                T_JSON,
+                err_json(&format!("image type {} is not for this dongle", d.typ)),
+            );
         };
-        let slice = &data[d.payload_offset .. d.payload_offset + d.length as usize];
+        let (node, magic, slot_size) = (slot.node.as_str(), slot.magic.as_slice(), slot.size);
+        let slice = &data[d.payload_offset..d.payload_offset + d.length as usize];
 
         if (d.length as u64) > slot_size {
-            let _ = fs::remove_file("/tmp/livi/led/flash-mode");
-            return (S_400, T_JSON, err_json(&format!(
-                "image type {} ({}) is {} B, exceeds slot {} B", d.typ, node, d.length, slot_size
-            )));
+            led_flash_error();
+            return (
+                S_400,
+                T_JSON,
+                err_json(&format!(
+                    "image type {} ({}) is {} B, exceeds slot {} B",
+                    d.typ, node, d.length, slot_size
+                )),
+            );
         }
         if !slice.starts_with(magic) {
-            let _ = fs::remove_file("/tmp/livi/led/flash-mode");
-            return (S_400, T_JSON, err_json(&format!(
-                "image type {} payload magic mismatch for {}", d.typ, node
-            )));
+            led_flash_error();
+            return (
+                S_400,
+                T_JSON,
+                err_json(&format!("image type {} payload magic mismatch for {}", d.typ, node)),
+            );
         }
 
+        let image = staged.as_deref().unwrap_or(slice);
+        let len = image.len();
         let path = format!("/dev/{node}");
+        // What's on the chip is read through the character device: the block device answers from the page
+        // cache, so a read-back through it agrees with what was just written whether it reached the chip or not.
+        let raw = raw_mtd(node);
         // Compare against what's already on flash.
-        write_progress(node, 0, d.length as usize, "compare");
-        let same = flash_matches(&path, slice).unwrap_or(false);
+        write_progress(node, 0, len, "compare");
+        let same = flash_matches(&raw, image).unwrap_or(false);
         if same {
             report.push(format!("{} unchanged", node));
-            write_progress(node, d.length as usize, d.length as usize, "unchanged");
+            write_progress(node, len, len, "unchanged");
             continue;
         }
 
+        if let Some(before) = slot.before_write
+            && let Err(e) = before()
+        {
+            led_flash_error();
+            write_progress(node, 0, len, "error");
+            report.push(format!("{node}: {e}, not written"));
+            return (S_500, T_JSON, err_json(&report.join(", ")));
+        }
+
         // Different — write + verify.
-        write_progress(node, 0, d.length as usize, "write");
-        if let Err(e) = write_chunked(&path, slice, node) {
-            let _ = fs::remove_file("/tmp/livi/led/flash-mode");
-            write_progress(node, 0, d.length as usize, "error");
+        write_progress(node, 0, len, "write");
+        if let Err(e) = write_chunked(&path, image, node) {
+            led_flash_error();
+            write_progress(node, 0, len, "error");
             return (S_500, T_JSON, err_json(&format!("write /dev/{node}: {e}")));
         }
-        write_progress(node, d.length as usize, d.length as usize, "verify");
-        if let Err(e) = verify_flash(&path, slice) {
-            let _ = fs::remove_file("/tmp/livi/led/flash-mode");
-            write_progress(node, d.length as usize, d.length as usize, "error");
-            return (S_500, T_JSON, err_json(&format!(
-                "verify /dev/{node} failed: {e} — DO NOT reboot, use FEL to restore"
-            )));
+        write_progress(node, len, len, "verify");
+        if let Err(e) = verify_flash(&raw, image) {
+            led_flash_error();
+            write_progress(node, len, len, "error");
+            return (
+                S_500,
+                T_JSON,
+                err_json(&format!(
+                    "verify {raw} failed: {e} — DO NOT reboot, do not unplug, the chip does not hold what was written"
+                )),
+            );
         }
         wrote_any = true;
         report.push(format!("{} written", node));
     }
 
+    if wrote_any && let Err(e) = post_write_check(f) {
+        write_progress("bundle", data.len(), data.len(), "error");
+        return (S_500, T_JSON, err_json(&format!("{}, but {e}", report.join(", "))));
+    }
     write_progress("bundle", data.len(), data.len(), "done");
     if wrote_any {
+        // Only now, with every image verified and the check behind it, the LEDs say it is over.
+        led_flash_done();
         reboot_after(Duration::from_millis(500));
         (S_200, T_JSON, ok_json(&format!("{}, rebooting", report.join(", "))))
     } else {
-        let _ = fs::remove_file("/tmp/livi/led/flash-mode");
+        led_flash_clear();
         (S_200, T_JSON, ok_json("Up-to-date"))
+    }
+}
+
+fn post_write_check(f: &Flash) -> Result<(), String> {
+    let Some(cmd) = &f.check else { return Ok(()) };
+    match Command::new("sh").arg("-c").arg(cmd).status() {
+        Ok(st) if st.success() => Ok(()),
+        _ => {
+            led_flash_error();
+            Err(format!("{cmd} failed after the write, not rebooting"))
+        }
+    }
+}
+
+const LED_DIR: &str = "/tmp/livi/led";
+
+// The state the LEDs show while a partition is being written, one file each under /tmp/livi/led:
+//   flash-mode  red/blue alternating, from before the first byte until the last image is verified
+//   flash-done  steady green, everything is on the chip and verified: safe to unplug or reboot
+//   flash-error steady red, a write or its check failed: do not unplug, do not reboot into it
+// Reboot clears the tmpfs, and where it does not work yet the state stays until the plug is pulled.
+fn led_flash_set(state: Option<&str>) {
+    let _ = fs::create_dir_all(LED_DIR);
+    for f in ["flash-mode", "flash-done", "flash-error"] {
+        let _ = fs::remove_file(format!("{LED_DIR}/{f}"));
+    }
+    if let Some(name) = state {
+        let _ = fs::write(format!("{LED_DIR}/{name}"), b"");
+    }
+}
+fn led_flash_running() {
+    led_flash_set(Some("flash-mode"))
+}
+fn led_flash_done() {
+    led_flash_set(Some("flash-done"))
+}
+fn led_flash_error() {
+    led_flash_set(Some("flash-error"))
+}
+/// Nothing was written after all: back to the normal display.
+fn led_flash_clear() {
+    led_flash_set(None)
+}
+
+/// The unbuffered character device of an MTD block node: `mtdblock6` is `/dev/mtd6`.
+fn raw_mtd(node: &str) -> String {
+    match node.strip_prefix("mtdblock") {
+        Some(n) => format!("/dev/mtd{n}"),
+        None => format!("/dev/{node}"),
     }
 }
 
@@ -529,7 +637,9 @@ fn crc32(data: &[u8]) -> u32 {
         for _ in 0..8 {
             let mix = (crc ^ byte) & 1;
             crc >>= 1;
-            if mix != 0 { crc ^= 0xEDB8_8320; }
+            if mix != 0 {
+                crc ^= 0xEDB8_8320;
+            }
             byte >>= 1;
         }
     }
@@ -538,10 +648,7 @@ fn crc32(data: &[u8]) -> u32 {
 
 fn write_chunked(path: &str, data: &[u8], node: &str) -> std::io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
-    let mut f = fs::OpenOptions::new()
-        .write(true)
-        .custom_flags(libc::O_SYNC)
-        .open(path)?;
+    let mut f = fs::OpenOptions::new().write(true).custom_flags(libc::O_SYNC).open(path)?;
     // 64 KiB chunks give ~50 progress updates for a 3 MiB payload — enough
     // to feel live, few enough to keep the /tmp/livi/flash-progress writes
     // negligible next to the actual NOR erase+program cost.
@@ -553,25 +660,15 @@ fn write_chunked(path: &str, data: &[u8], node: &str) -> std::io::Result<()> {
         write_progress(node, written, data.len(), "write");
     }
     f.sync_all()?;
-    unsafe { libc::sync(); }
-    Ok(())
-}
-
-/// Write a whole file and flush it to storage.
-fn write_sync(path: &str, data: &[u8]) -> std::io::Result<()> {
-    let mut f = fs::OpenOptions::new().write(true).create(true).truncate(true).open(path)?;
-    f.write_all(data)?;
-    f.sync_all()?;
-    unsafe { libc::sync(); }
+    unsafe {
+        libc::sync();
+    }
     Ok(())
 }
 
 fn write_progress(node: &str, written: usize, total: usize, phase: &str) {
     let _ = fs::create_dir_all("/tmp/livi");
-    let _ = fs::write(
-        "/tmp/livi/flash-progress",
-        format!("{node}:{written}:{total}:{phase}\n"),
-    );
+    let _ = fs::write("/tmp/livi/flash-progress", format!("{node}:{written}:{total}:{phase}\n"));
 }
 
 fn flash_status_json() -> String {
@@ -583,11 +680,14 @@ fn flash_status_json() -> String {
     }
     let node = parts[0];
     let written: u64 = parts[1].parse().unwrap_or(0);
-    let total:   u64 = parts[2].parse().unwrap_or(0);
+    let total: u64 = parts[2].parse().unwrap_or(0);
     let phase = parts[3];
     format!(
         r#"{{"phase":"{}","node":"{}","written":{},"total":{}}}"#,
-        js(phase), js(node), written, total
+        js(phase),
+        js(node),
+        written,
+        total
     )
 }
 
@@ -600,11 +700,14 @@ fn verify_flash(path: &str, expected: &[u8]) -> std::io::Result<()> {
     } else {
         let mut diff_at = 0;
         for (i, (a, b)) in got.iter().zip(expected.iter()).enumerate() {
-            if a != b { diff_at = i; break; }
+            if a != b {
+                diff_at = i;
+                break;
+            }
         }
         Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("read-back mismatch at byte {diff_at}")
+            format!("read-back mismatch at byte {diff_at}"),
         ))
     }
 }
@@ -617,25 +720,14 @@ fn reboot_soon() -> (&'static str, &'static str, Vec<u8>) {
 fn reboot_after(delay: Duration) {
     thread::spawn(move || {
         thread::sleep(delay);
-        unsafe { libc::sync(); }
+        unsafe {
+            libc::sync();
+        }
         // Prefer busybox reboot (userspace-friendly), fall back to the syscall.
         let _ = Command::new("/sbin/reboot").arg("-f").status();
         unsafe {
             libc::reboot(libc::LINUX_REBOOT_CMD_RESTART);
         }
-    });
-}
-
-/// Re-runs the stack launcher detached, after the response has been sent — it takes this httpd
-/// with it, so it must outlive the process.
-fn restart_after(delay: Duration, cmd: String) {
-    thread::spawn(move || {
-        thread::sleep(delay);
-        unsafe { libc::sync(); }
-        let _ = Command::new("/bin/sh")
-            .arg("-c")
-            .arg(format!("setsid {cmd} </dev/null >/tmp/livi/stack-restart.log 2>&1 &"))
-            .status();
     });
 }
 
@@ -671,12 +763,21 @@ fn bt_json() -> String {
         .unwrap_or_default();
     }
     let present = std::path::Path::new(&format!("/sys/class/bluetooth/{bt}")).exists();
-    let state = if !present { "not present" }
-                else if mac.is_empty() { "up, MAC unknown" }
-                else { "up" };
+    let enabled = radio::enabled(Radio::Bt);
+    let state = if !enabled {
+        "switched off"
+    } else if !present {
+        "not present"
+    } else if mac.is_empty() {
+        "up, MAC unknown"
+    } else {
+        "up"
+    };
     format!(
-        r#"{{"name":"{}","mac":"{}","state":"{}"}}"#,
-        js(&name), js(&mac), js(state)
+        r#"{{"enabled":{enabled},"name":"{}","mac":"{}","state":"{}"}}"#,
+        js(&name),
+        js(&mac),
+        js(state)
     )
 }
 
@@ -704,25 +805,49 @@ fn wifi_json() -> String {
         if let Some(cfg) = cfg {
             for line in cfg.lines() {
                 let l = line.trim();
-                if let Some(v) = l.strip_prefix("ssid=")     { ssid = v.to_string(); }
-                else if let Some(v) = l.strip_prefix("channel=")  { ch = v.to_string(); }
-                else if let Some(v) = l.strip_prefix("hw_mode=")  { band = match v { "a" => "5 GHz", "g" => "2.4 GHz", "b" => "2.4 GHz", _ => v }.to_string(); }
+                if let Some(v) = l.strip_prefix("ssid=") {
+                    ssid = v.to_string();
+                } else if let Some(v) = l.strip_prefix("channel=") {
+                    ch = v.to_string();
+                } else if let Some(v) = l.strip_prefix("hw_mode=") {
+                    band = match v {
+                        "a" => "5 GHz",
+                        "g" => "2.4 GHz",
+                        "b" => "2.4 GHz",
+                        _ => v,
+                    }
+                    .to_string();
+                }
             }
         }
     }
     let mac = read_trim(&format!("/sys/class/net/{iface}/address"));
-    // Clients from the bridge forwarding table where there is a bridge (V821B/br0), else via an
-    // nl80211 station dump (cpc200 bridges with l2fwd, no br0).
+    // Clients from the bridge forwarding table where there is a bridge, else via an nl80211
+    // station dump.
     let clients = match caps().bridge.as_deref() {
         Some(br) => bridge_port_clients(br, iface),
         None => livi_wifi::station_count(iface),
     };
     let (downrate, uprate) = livi_wifi::station_rates(iface).unwrap_or((0, 0));
-    let downbytes = read_trim(&format!("/sys/class/net/{iface}/statistics/rx_bytes")).parse::<u64>().unwrap_or(0);
-    let upbytes = read_trim(&format!("/sys/class/net/{iface}/statistics/tx_bytes")).parse::<u64>().unwrap_or(0);
+    let downbytes = read_trim(&format!("/sys/class/net/{iface}/statistics/rx_bytes"))
+        .parse::<u64>()
+        .unwrap_or(0);
+    let upbytes = read_trim(&format!("/sys/class/net/{iface}/statistics/tx_bytes"))
+        .parse::<u64>()
+        .unwrap_or(0);
     format!(
-        r#"{{"ssid":"{}","mac":"{}","band":"{}","channel":"{}","width":{},"clients":{},"downrate":{},"uprate":{},"downbytes":{},"upbytes":{}}}"#,
-        js(&ssid), js(&mac), js(&band), js(&ch), width, clients, downrate, uprate, downbytes, upbytes
+        r#"{{"enabled":{},"ssid":"{}","mac":"{}","band":"{}","channel":"{}","width":{},"clients":{},"downrate":{},"uprate":{},"downbytes":{},"upbytes":{}}}"#,
+        radio::enabled(Radio::Wifi),
+        js(&ssid),
+        js(&mac),
+        js(&band),
+        js(&ch),
+        width,
+        clients,
+        downrate,
+        uprate,
+        downbytes,
+        upbytes
     )
 }
 
@@ -737,28 +862,40 @@ fn bridge_port_clients(bridge: &str, port: &str) -> usize {
     let Ok(fdb) = fs::read(format!("/sys/class/net/{bridge}/brforward")) else {
         return 0;
     };
-    fdb.as_chunks::<16>()
-        .0
-        .iter()
-        .filter(|entry| entry[6] == port_no && entry[7] == 0)
-        .count()
+    fdb.as_chunks::<16>().0.iter().filter(|entry| entry[6] == port_no && entry[7] == 0).count()
 }
 
 fn status_json() -> String {
     let kernel = read_trim("/proc/sys/kernel/osrelease");
     let uptime = fmt_uptime(&read_trim("/proc/uptime"));
-    let load   = read_trim("/proc/loadavg");
-    let mem    = fmt_meminfo();
-    let mac    = read_trim(&format!("/sys/class/net/{}/address", caps().host_iface));
+    let load = read_trim("/proc/loadavg");
+    let mem = fmt_meminfo();
+    let mac = read_trim(&format!("/sys/class/net/{}/address", caps().host_iface));
+    let mut cp = read_trim(&caps().mfi);
+    if cp.is_empty() {
+        cp = "not found".into();
+    }
     format!(
-        r#"{{"model":"{}","target":"{}","version":"{}","build":"{}","kernel":"{}","uptime":"{}","load":"{}","mem":"{}","mac":"{}"}}"#,
-        js(&caps().model), js(&caps().target), js(VERSION), js(BUILD),
-        js(&kernel), js(&uptime), js(&load), js(&mem), js(&mac)
+        r#"{{"model":"{}","target":"{}","version":"{}","build":"{}","kernel":"{}","uptime":"{}","load":"{}","mem":"{}","mac":"{}","cp":"{}"}}"#,
+        js(&caps().model),
+        js(&caps().target),
+        js(VERSION),
+        js(BUILD),
+        js(&kernel),
+        js(&uptime),
+        js(&load),
+        js(&mem),
+        js(&mac),
+        js(&cp)
     )
 }
 
-fn ok_json(msg: &str)  -> Vec<u8> { format!(r#"{{"ok":true,"message":"{}"}}"#,  js(msg)).into_bytes() }
-fn err_json(msg: &str) -> Vec<u8> { format!(r#"{{"ok":false,"error":"{}"}}"#, js(msg)).into_bytes() }
+fn ok_json(msg: &str) -> Vec<u8> {
+    format!(r#"{{"ok":true,"message":"{}"}}"#, js(msg)).into_bytes()
+}
+fn err_json(msg: &str) -> Vec<u8> {
+    format!(r#"{{"ok":false,"error":"{}"}}"#, js(msg)).into_bytes()
+}
 
 // ---------------------------------------------------------------------------
 // LED config API (paired with livi-ledd)
@@ -771,30 +908,45 @@ const LED_PID: &str = "/tmp/livi/livi-ledd.pid";
 
 fn led_json() -> String {
     // Default matches livi-ledd's Config::default() = web-UI accent #4dd0e1.
-    let mut r = 0x4du8; let mut g = 0xd0u8; let mut b = 0xe1u8;
+    let mut r = 0x4du8;
+    let mut g = 0xd0u8;
+    let mut b = 0xe1u8;
     let mut brightness = 20u8; // 0-100 %
     if let Ok(s) = fs::read_to_string(LED_CFG) {
         for line in s.lines() {
             let line = line.trim();
             // Only whole-line comments — a `#` mid-value belongs to the value.
-            if line.is_empty() || line.starts_with('#') { continue; }
-            let Some((k, v)) = line.split_once('=') else { continue; };
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((k, v)) = line.split_once('=') else {
+                continue;
+            };
             let v = v.trim().trim_matches('"');
             match k.trim() {
-                "status_color" => if let Some((rr, gg, bb)) = parse_rgb(v) { r = rr; g = gg; b = bb; },
-                "brightness"   => if let Ok(n) = v.parse::<u8>() { brightness = n.min(100); },
+                "status_color" => {
+                    if let Some((rr, gg, bb)) = parse_rgb(v) {
+                        r = rr;
+                        g = gg;
+                        b = bb;
+                    }
+                }
+                "brightness" => {
+                    if let Ok(n) = v.parse::<u8>() {
+                        brightness = n.min(100);
+                    }
+                }
                 _ => {}
             }
         }
     }
-    format!(
-        r##"{{"status_color":"#{:02x}{:02x}{:02x}","brightness":{}}}"##,
-        r, g, b, brightness
-    )
+    format!(r##"{{"status_color":"#{:02x}{:02x}{:02x}","brightness":{}}}"##, r, g, b, brightness)
 }
 
 fn set_led(body: Option<&[u8]>) -> (&'static str, &'static str, Vec<u8>) {
-    let Some(data) = body else { return (S_400, T_JSON, err_json("empty body")); };
+    let Some(data) = body else {
+        return (S_400, T_JSON, err_json("empty body"));
+    };
     let Ok(s) = std::str::from_utf8(data) else {
         return (S_400, T_JSON, err_json("body not UTF-8"));
     };
@@ -815,11 +967,13 @@ fn set_led(body: Option<&[u8]>) -> (&'static str, &'static str, Vec<u8>) {
         }
     } else {
         for kv in trimmed.split('&') {
-            let Some((k, v)) = kv.split_once('=') else { continue; };
+            let Some((k, v)) = kv.split_once('=') else {
+                continue;
+            };
             let v = url_decode(v);
             match k {
                 "status_color" => status = parse_rgb(&v),
-                "brightness"   => brightness = v.parse::<u8>().ok().map(|n| n.min(100)),
+                "brightness" => brightness = v.parse::<u8>().ok().map(|n| n.min(100)),
                 _ => {}
             }
         }
@@ -827,8 +981,11 @@ fn set_led(body: Option<&[u8]>) -> (&'static str, &'static str, Vec<u8>) {
 
     // Merge with existing config so partial updates don't nuke fields.
     let existing = led_json();
-    let cur_status = json_str(&existing, "status_color").and_then(|v| parse_rgb(&v)).unwrap_or((0x4d,0xd0,0xe1));
-    let cur_bri    = json_num(&existing, "brightness").and_then(|v| v.parse::<u8>().ok()).unwrap_or(20);
+    let cur_status = json_str(&existing, "status_color")
+        .and_then(|v| parse_rgb(&v))
+        .unwrap_or((0x4d, 0xd0, 0xe1));
+    let cur_bri =
+        json_num(&existing, "brightness").and_then(|v| v.parse::<u8>().ok()).unwrap_or(20);
 
     let (r, g, b) = status.unwrap_or(cur_status);
     let bri = brightness.unwrap_or(cur_bri);
@@ -902,16 +1059,64 @@ fn set_update(body: Option<&[u8]>) -> (&'static str, &'static str, Vec<u8>) {
     (S_200, T_JSON, ok_json("update channel saved"))
 }
 
+/// Switches through wifid, the one place that does, so the page and a host take the same path.
+fn switch_radio(body: Option<&[u8]>, radio: Radio) -> (&'static str, &'static str, Vec<u8>) {
+    let Some(s) = body.and_then(|b| std::str::from_utf8(b).ok()) else {
+        return (S_400, T_JSON, err_json("empty body"));
+    };
+    let on = match json_num(s.trim(), "enabled").as_deref() {
+        Some("1") => true,
+        Some("0") => false,
+        _ => return (S_400, T_JSON, err_json("enabled must be 0 or 1")),
+    };
+    let command = match (radio, on) {
+        (Radio::Wifi, true) => "on",
+        (Radio::Wifi, false) => "off",
+        (Radio::Bt, true) => "bt on",
+        (Radio::Bt, false) => "bt off",
+    };
+    if let Err(e) = wifid(command) {
+        return (S_500, T_JSON, err_json(&e));
+    }
+    let json = match radio {
+        Radio::Wifi => wifi_json(),
+        Radio::Bt => bt_json(),
+    };
+    (S_200, T_JSON, json.into_bytes())
+}
+
+fn wifid(command: &str) -> Result<(), String> {
+    let addr = SocketAddr::from(([127, 0, 0, 1], livi_wifi::server::PORT));
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))
+        .map_err(|e| format!("wifid: {e}"))?;
+    // Bringing the AP or hci0 up takes a while.
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+    stream.write_all(format!("{command}\n").as_bytes()).map_err(|e| format!("wifid: {e}"))?;
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line).map_err(|e| format!("wifid: {e}"))?;
+    match line.trim() {
+        "ok" => Ok(()),
+        other => Err(other.strip_prefix("error ").unwrap_or(other).to_string()),
+    }
+}
+
 fn kick_ledd() {
-    let Ok(s) = fs::read_to_string(LED_PID) else { return; };
-    let Ok(pid) = s.trim().parse::<i32>() else { return; };
-    unsafe { libc::kill(pid, libc::SIGHUP); }
+    let Ok(s) = fs::read_to_string(LED_PID) else {
+        return;
+    };
+    let Ok(pid) = s.trim().parse::<i32>() else {
+        return;
+    };
+    unsafe {
+        libc::kill(pid, libc::SIGHUP);
+    }
 }
 
 fn persist_config() {
     // Fire off `livid config save` — non-blocking, no waiting on flash I/O.
     let _ = Command::new("/usr/bin/livid")
-        .arg("config").arg("save")
+        .arg("config")
+        .arg("save")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -921,14 +1126,18 @@ fn persist_config() {
 fn parse_rgb(s: &str) -> Option<(u8, u8, u8)> {
     let s = s.trim();
     if let Some(hex) = s.strip_prefix('#') {
-        if hex.len() != 6 { return None; }
+        if hex.len() != 6 {
+            return None;
+        }
         let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
         let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
         let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
         return Some((r, g, b));
     }
     let parts: Vec<_> = s.split(',').map(|p| p.trim()).collect();
-    if parts.len() != 3 { return None; }
+    if parts.len() != 3 {
+        return None;
+    }
     Some((parts[0].parse().ok()?, parts[1].parse().ok()?, parts[2].parse().ok()?))
 }
 
@@ -951,7 +1160,9 @@ fn json_num(hay: &str, key: &str) -> Option<String> {
     let colon = after.find(':')?;
     let rest = after[colon + 1..].trim_start();
     let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
-    if end == 0 { return None; }
+    if end == 0 {
+        return None;
+    }
     Some(rest[..end].to_string())
 }
 
@@ -979,13 +1190,13 @@ fn read_trim(path: &str) -> String {
 }
 
 fn fmt_uptime(s: &str) -> String {
-    let secs = s.split_whitespace().next().and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0) as u64;
+    let secs =
+        s.split_whitespace().next().and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0) as u64;
     let d = secs / 86400;
     let h = (secs % 86400) / 3600;
     let m = (secs % 3600) / 60;
     let s = secs % 60;
-    if d > 0 { format!("{d}d {h:02}:{m:02}:{s:02}") }
-    else     { format!("{h:02}:{m:02}:{s:02}") }
+    if d > 0 { format!("{d}d {h:02}:{m:02}:{s:02}") } else { format!("{h:02}:{m:02}:{s:02}") }
 }
 
 fn fmt_meminfo() -> String {
@@ -1000,14 +1211,22 @@ fn fmt_meminfo() -> String {
             }
         }
     }
-    format!("{} KiB used / {} KiB total", total_kb.saturating_sub(avail_kb), total_kb)
+    mem_text(total_kb, avail_kb)
+}
+
+fn mem_text(total_kb: u64, avail_kb: u64) -> String {
+    let mb = |kb: u64| (kb + 512) / 1024;
+    format!("{} MB used / {} MB total", mb(total_kb.saturating_sub(avail_kb)), mb(total_kb))
 }
 
 fn js(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
-            '"' | '\\' => { out.push('\\'); out.push(c); }
+            '"' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
             '\n' | '\r' => out.push(' '),
             _ => out.push(c),
         }
@@ -1015,7 +1234,12 @@ fn js(s: &str) -> String {
     out
 }
 
-fn write_response(w: &mut TcpStream, status: &str, ctype: &str, body: &[u8]) -> std::io::Result<()> {
+fn write_response(
+    w: &mut TcpStream,
+    status: &str,
+    ctype: &str,
+    body: &[u8],
+) -> std::io::Result<()> {
     let header = format!(
         "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
         body.len()
@@ -1032,3 +1256,20 @@ const S_500: &str = "500 Internal Server Error";
 const T_HTML: &str = "text/html; charset=utf-8";
 const T_JSON: &str = "application/json";
 const T_TEXT: &str = "text/plain; charset=utf-8";
+
+#[cfg(test)]
+mod tests {
+    use super::{mem_text, raw_mtd};
+
+    #[test]
+    fn a_block_node_is_read_back_through_its_character_device() {
+        assert_eq!(raw_mtd("mtdblock6"), "/dev/mtd6");
+        assert_eq!(raw_mtd("mtdblock12"), "/dev/mtd12");
+        assert_eq!(raw_mtd("mtd6"), "/dev/mtd6");
+    }
+
+    #[test]
+    fn memory_reads_in_whole_megabytes() {
+        assert_eq!(mem_text(123_940, 112_276), "11 MB used / 121 MB total");
+    }
+}

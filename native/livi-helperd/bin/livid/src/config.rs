@@ -2,7 +2,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::Path;
 
-const MTD_DEV: &str = "/dev/mtdblock4";
+const MTD_DEV_FALLBACK: &str = "/dev/mtdblock4";
 const MAGIC: &[u8; 4] = b"LVCF";
 const VERSION_V1: u16 = 1;
 const VERSION_V2: u16 = 2;
@@ -15,6 +15,7 @@ const TMPFS_LED: &str = "/tmp/livi/led.toml";
 const TMPFS_HOSTAPD: &str = "/tmp/livi/hostapd.conf.saved";
 const TMPFS_BT_KEYS: &str = "/tmp/livi/bt-keys";
 const TMPFS_UPDATE: &str = "/tmp/livi/update.conf";
+const TMPFS_RADIO: &str = livi_wifi::radio::PATH;
 const DEFAULT_LED: &str = "/etc/livi/led.toml";
 const DEFAULT_HOSTAPD: &str = "/etc/hostapd.conf";
 
@@ -22,6 +23,25 @@ const ENTRY_LED: &str = "led.toml";
 const ENTRY_HOSTAPD: &str = "hostapd.conf.saved";
 const ENTRY_BT_KEYS: &str = "bt-keys";
 const ENTRY_UPDATE: &str = "update.conf";
+const ENTRY_RADIO: &str = "radio.conf";
+
+/// The partition table differs per board, so the config lives on whichever MTD is named
+/// "customer". The old fixed device is only the fallback.
+fn mtd_dev() -> &'static str {
+    static DEV: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    DEV.get_or_init(|| {
+        let by_name = fs::read_dir("/sys/class/mtd").ok().and_then(|dir| {
+            dir.flatten().find_map(|e| {
+                let name = e.file_name().into_string().ok()?;
+                let n =
+                    name.strip_prefix("mtd").filter(|n| n.bytes().all(|b| b.is_ascii_digit()))?;
+                let label = fs::read_to_string(e.path().join("name")).ok()?;
+                (label.trim() == "customer").then(|| format!("/dev/mtdblock{n}"))
+            })
+        });
+        by_name.unwrap_or_else(|| MTD_DEV_FALLBACK.to_string())
+    })
+}
 
 pub fn run(args: Vec<String>) -> i32 {
     match args.first().map(|s| s.as_str()).unwrap_or("") {
@@ -49,6 +69,7 @@ fn cmd_load() -> i32 {
                     ENTRY_HOSTAPD => TMPFS_HOSTAPD,
                     ENTRY_BT_KEYS => TMPFS_BT_KEYS,
                     ENTRY_UPDATE => TMPFS_UPDATE,
+                    ENTRY_RADIO => TMPFS_RADIO,
                     _ => {
                         eprintln!("[livid config load] skipping unknown entry {:?}", e.name);
                         continue;
@@ -59,10 +80,10 @@ fn cmd_load() -> i32 {
                     return 1;
                 }
             }
-            eprintln!("[livid config load] restored from {MTD_DEV}");
+            eprintln!("[livid config load] restored from {}", mtd_dev());
         }
         Err(err) => {
-            eprintln!("[livid config load] {MTD_DEV} not usable ({err}); seeding defaults");
+            eprintln!("[livid config load] {} not usable ({err}); seeding defaults", mtd_dev());
         }
     }
     seed_if_missing(TMPFS_LED, DEFAULT_LED);
@@ -106,6 +127,7 @@ fn cmd_save() -> i32 {
         (ENTRY_HOSTAPD, TMPFS_HOSTAPD),
         (ENTRY_BT_KEYS, TMPFS_BT_KEYS),
         (ENTRY_UPDATE, TMPFS_UPDATE),
+        (ENTRY_RADIO, TMPFS_RADIO),
     ] {
         match fs::read(path) {
             Ok(data) if !data.is_empty() && data.len() <= MAX_ENTRY => {
@@ -121,10 +143,13 @@ fn cmd_save() -> i32 {
     }
     let blob = match pack_v2(&entries) {
         Ok(b) => b,
-        Err(e) => { eprintln!("[livid config save] pack: {e}"); return 1; }
+        Err(e) => {
+            eprintln!("[livid config save] pack: {e}");
+            return 1;
+        }
     };
     if let Err(e) = write_blob(&blob) {
-        eprintln!("[livid config save] write {MTD_DEV}: {e}");
+        eprintln!("[livid config save] write {}: {e}", mtd_dev());
         return 1;
     }
     match read_blob() {
@@ -135,15 +160,18 @@ fn cmd_save() -> i32 {
                 eprintln!("[livid config save] verify: read-back differs");
                 return 2;
             }
-            eprintln!("[livid config save] {} entries persisted to {MTD_DEV}", entries.len());
+            eprintln!("[livid config save] {} entries persisted to {}", entries.len(), mtd_dev());
             0
         }
-        Err(e) => { eprintln!("[livid config save] verify: {e}"); 2 }
+        Err(e) => {
+            eprintln!("[livid config save] verify: {e}");
+            2
+        }
     }
 }
 
 fn read_blob() -> std::io::Result<Vec<Entry>> {
-    let mut f = fs::File::open(MTD_DEV)?;
+    let mut f = fs::File::open(mtd_dev())?;
     let mut hdr = [0u8; HEADER_LEN];
     f.read_exact(&mut hdr)?;
     if &hdr[0..4] != MAGIC {
@@ -188,7 +216,10 @@ fn unpack_v2(payload: &[u8]) -> std::io::Result<Vec<Entry>> {
             .map_err(|_| io_err("v2 non-utf8 name"))?
             .to_string();
         let len = u32::from_le_bytes([
-            payload[off + 32], payload[off + 33], payload[off + 34], payload[off + 35],
+            payload[off + 32],
+            payload[off + 33],
+            payload[off + 34],
+            payload[off + 35],
         ]) as usize;
         if cursor + len > payload.len() {
             return Err(io_err(&format!("v2 entry {i} extends past payload")));
@@ -239,13 +270,12 @@ fn pack_v2(entries: &[Entry]) -> Result<Vec<u8>, String> {
 
 fn write_blob(blob: &[u8]) -> std::io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
-    let mut f = fs::OpenOptions::new()
-        .write(true)
-        .custom_flags(libc::O_SYNC)
-        .open(MTD_DEV)?;
+    let mut f = fs::OpenOptions::new().write(true).custom_flags(libc::O_SYNC).open(mtd_dev())?;
     f.write_all(blob)?;
     f.sync_all()?;
-    unsafe { libc::sync(); }
+    unsafe {
+        libc::sync();
+    }
     Ok(())
 }
 
@@ -256,7 +286,9 @@ fn crc32(data: &[u8]) -> u32 {
         for _ in 0..8 {
             let mix = (crc ^ byte) & 1;
             crc >>= 1;
-            if mix != 0 { crc ^= 0xEDB8_8320; }
+            if mix != 0 {
+                crc ^= 0xEDB8_8320;
+            }
             byte >>= 1;
         }
     }

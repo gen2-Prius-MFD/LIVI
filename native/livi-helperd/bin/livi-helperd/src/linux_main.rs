@@ -6,7 +6,7 @@ use iap2_mfi::{I2cCoprocessor, NcmCoprocessor, NoCoprocessor};
 use std::sync::Arc;
 
 use livi_runtime::bonjour::Bonjour;
-use livi_runtime::bringup::{CpConfig, run_accessory};
+use livi_runtime::bringup::{AskOnAir, CpConfig, run_accessory};
 use livi_runtime::bt;
 use livi_runtime::driver::{spawn_link, spawn_link_stream};
 use livi_runtime::ident::{Identity, Transport};
@@ -23,10 +23,7 @@ const ATTACH_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 const BT_FALLBACK: &str = "hci0";
 
 fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
 fn config_path() -> std::path::PathBuf {
@@ -61,10 +58,7 @@ impl DeviceConfig {
         {
             return s.to_string();
         }
-        std::env::var(env_key)
-            .ok()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| default.to_string())
+        std::env::var(env_key).ok().filter(|s| !s.is_empty()).unwrap_or_else(|| default.to_string())
     }
 
     pub fn int<T: std::str::FromStr + std::convert::TryFrom<i64>>(
@@ -211,10 +205,7 @@ pub fn run_bt_tunnel() -> ExitCode {
 }
 
 pub fn run() -> ExitCode {
-    let rt = match tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-    {
+    let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
         Ok(rt) => rt,
         Err(e) => {
             eprintln!("[helperd] runtime: {e}");
@@ -238,10 +229,9 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     let name = dc.string("carName", "LIVI_CP_NAME", "LIVI");
     let ssid = name.clone();
     let wifi_iface = ap_iface(&dc);
-    let ap_mac = (dc.string("wifiInterface", "LIVI_WIFI_IFACE", "wlan0")
-        == livi_dongle::link::CHOICE)
-        .then(livi_dongle::ap::mac)
-        .flatten();
+    let dongle_ap =
+        dc.string("wifiInterface", "LIVI_WIFI_IFACE", "wlan0") == livi_dongle::link::CHOICE;
+    let ap_mac = dongle_ap.then(livi_dongle::ap::mac).flatten();
     let cp = CpConfig {
         wifi_iface: wifi_iface.clone(),
         ssid: ssid.clone(),
@@ -259,6 +249,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
             500u16,
         ),
         ap_mac: ap_mac.clone(),
+        ap_on_air: dongle_ap.then_some(livi_dongle::ap::on_air as AskOnAir),
     };
     let pk = std::env::var("LIVI_CP_PK").unwrap_or_default();
     let pi = std::env::var("LIVI_CP_PI").unwrap_or_default();
@@ -269,10 +260,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     let (auth, mfi_link) = match I2cCoprocessor::open(bus_num, gpio) {
         Ok(chip) => {
             println!("[helperd] MFi addr=0x{:02X}", chip.address());
-            (
-                Some(SharedCoprocessor::new(Box::new(chip))),
-                crate::link::LinkPresence::always(),
-            )
+            (Some(SharedCoprocessor::new(Box::new(chip))), crate::link::LinkPresence::always())
         }
         Err(e) => {
             println!(
@@ -310,11 +298,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         .is_ok_and(|v| v == "1")
         .then(|| livi_dongle::iap::sessions(|| true));
     let bt_mac = bt::adapter_address(&conn, &adapter).await?;
-    println!(
-        "[helperd] adapter {} up (RFCOMM ch {})",
-        format_mac(&bt_mac),
-        bt::IAP_CHANNEL
-    );
+    println!("[helperd] adapter {} up (RFCOMM ch {})", format_mac(&bt_mac), bt::IAP_CHANNEL);
 
     let identity = Identity { name, ssid, bt_mac };
 
@@ -363,14 +347,11 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::var("LIVI_AA_WIRELESS").unwrap_or_else(|_| "1".into()) != "0" {
         // The projection listener the WPP bootstrap points the phone at.
         let events = aa_events.clone();
-        tokio::spawn(livi_aa::server::run(
-            env_or("LIVI_PORT", 5277u16),
-            move |socket, peer| {
-                events.push_json(format!(
+        tokio::spawn(livi_aa::server::run(env_or("LIVI_PORT", 5277u16), move |socket, peer| {
+            events.push_json(format!(
                 "{{\"event\":\"aa-session\",\"socket\":\"{socket}\",\"peer\":\"{peer}\",\"transport\":\"wifi\"}}"
             ));
-            },
-        ));
+        }));
         match bt::start_aa(&conn).await {
             Ok(incoming) => {
                 let aa_cfg = crate::aa::AaConfig {
@@ -419,20 +400,8 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         println!("[helperd] Android Auto USB watcher started");
     }
     if std::env::var("LIVI_DONGLE").unwrap_or_else(|_| "1".into()) != "0" {
-        let events = aa_events.clone();
         let mfi_link_state = mfi_link.clone();
-        tokio::spawn(livi_dongle::run(
-            move |on, _serial| mfi_link_state.set_on_bus(on),
-            move |socket, a| {
-                events.push_json(
-                    serde_json::json!({
-                        "event": "dongle-upload", "socket": socket, "serial": a.serial,
-                        "product": a.product, "version": a.version, "name": a.name
-                    })
-                    .to_string(),
-                );
-            },
-        ));
+        tokio::spawn(livi_dongle::run(move |on, _serial| mfi_link_state.set_on_bus(on)));
         println!("[helperd] dongle watcher started");
     }
     let mpris = match bt::start_media_player(&conn, &adapter, aa_events.clone()).await {
@@ -479,11 +448,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(auth) = auth.clone()
         && std::env::var("LIVI_CP_WIRED").unwrap_or_else(|_| "1".into()) != "0"
     {
-        let wired_cp = CpConfig {
-            transport: Transport::Wired,
-            av_iface: None,
-            ..cp.clone()
-        };
+        let wired_cp = CpConfig { transport: Transport::Wired, av_iface: None, ..cp.clone() };
         tokio::spawn(crate::wired::watch(
             auth,
             identity.clone(),
@@ -513,7 +478,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
 
     loop {
         tokio::select! {
-            _ = shutdown_signal() => {
+            _ = crate::shutdown_signal() => {
                 println!("[helperd] shutting down");
                 bt::set_discoverable(&conn, &adapter, false).await;
                 iap2_usbmux::restore_all_default_config();
@@ -565,24 +530,6 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-/// Ctrl-C or the TERM systemd/Electron sends when LIVI stops.
-async fn shutdown_signal() {
-    let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-        Ok(s) => s,
-        Err(_) => {
-            let _ = tokio::signal::ctrl_c().await;
-            return;
-        }
-    };
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = term.recv() => {}
-    }
-}
-
 fn format_mac(mac: &[u8; 6]) -> String {
-    mac.iter()
-        .map(|b| format!("{b:02X}"))
-        .collect::<Vec<_>>()
-        .join(":")
+    mac.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(":")
 }

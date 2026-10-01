@@ -4,12 +4,24 @@ run-name: 'livi-link → ${{ github.ref_name }}'
 on:
   workflow_dispatch:
     inputs:
-      cpc200_ccpa:
-        description: 'Build cpc200-ccpa (armv7, static-glibc)'
+      v821b_aic8800d80:
+        description: 'Build v821b_aic8800d80 (riscv32, musl, mainline kernel)'
         type: boolean
         default: true
-      v821b_aic8800d80:
-        description: 'Build v821b_aic8800d80 (riscv32, static-glibc)'
+      ax520_aic8800d80:
+        description: 'Build ax520_aic8800d80 (armv7, static-musl, mainline kernel)'
+        type: boolean
+        default: true
+      imx6ul_iw416:
+        description: 'Build imx6ul_iw416 (armv7, static-musl, mainline kernel)'
+        type: boolean
+        default: true
+      imx6ul_rtl8822cs:
+        description: 'Build imx6ul_rtl8822cs (armv7, static-musl, mainline kernel)'
+        type: boolean
+        default: true
+      imx6ul_rtl8822bs:
+        description: 'Build imx6ul_rtl8822bs (armv7, static-musl, mainline kernel)'
         type: boolean
         default: true
 
@@ -45,25 +57,27 @@ jobs:
   bundle-sanity:
     name: pack .lfwb bundle (dummy inputs)
     runs-on: ubuntu-latest
+    env:
+      TOP: ${{ github.workspace }}/build/bundle-sanity
     steps:
       - uses: actions/checkout@v6
 
       - name: Fake mtd1/mtd3 for pack-bundle
         run: |
-          mkdir -p ~/LocalDev/tina-test/out
-          printf 'ANDROID!' > ~/LocalDev/tina-test/out/livi-link-v821b-mtd1.bin
-          dd if=/dev/zero bs=1 count=1024 >> ~/LocalDev/tina-test/out/livi-link-v821b-mtd1.bin
-          printf 'hsqs'     > ~/LocalDev/tina-test/out/livi-link-v821b-mtd3.bin
-          dd if=/dev/zero bs=1 count=1024 >> ~/LocalDev/tina-test/out/livi-link-v821b-mtd3.bin
+          mkdir -p "$TOP/out"
+          printf 'ANDROID!' > "$TOP/out/livi-link-v821b-mtd1.bin"
+          dd if=/dev/zero bs=1 count=1024 >> "$TOP/out/livi-link-v821b-mtd1.bin"
+          printf 'hsqs'     > "$TOP/out/livi-link-v821b-mtd3.bin"
+          dd if=/dev/zero bs=1 count=1024 >> "$TOP/out/livi-link-v821b-mtd3.bin"
 
       - name: Run pack-bundle
-        run: bash scripts/livi-link/pack-bundle.sh
+        run: bash scripts/livi-link/common/pack-bundle.sh scripts/livi-link/riscv/v821b
 
       - name: Verify bundle structure
         shell: bash
         run: |
           set -euo pipefail
-          bundle=~/LocalDev/tina-test/out/livi-link-v821b.lfwb
+          bundle=$TOP/out/livi-link-v821b.lfwb
           [ "$(head -c 4 "$bundle")" = LFWB ] || { echo "bad magic" >&2; exit 1; }
           read -r version count < <(od -An -tu1 -j4 -N2 "$bundle")
           [ "$version" = 1 ] || { echo "bad version $version" >&2; exit 1; }
@@ -79,13 +93,19 @@ jobs:
     steps:
       - id: set
         env:
-          CPC: ${{ inputs.cpc200_ccpa }}
           V821: ${{ inputs.v821b_aic8800d80 }}
+          AX520: ${{ inputs.ax520_aic8800d80 }}
+          IMX6UL: ${{ inputs.imx6ul_iw416 }}
+          IMX6UL_RTL8822CS: ${{ inputs.imx6ul_rtl8822cs }}
+          IMX6UL_RTL8822BS: ${{ inputs.imx6ul_rtl8822bs }}
         run: |
           set -euo pipefail
           arr=()
-          [[ "$CPC"  == "true" ]] && arr+=('"cpc200-ccpa"')
-          [[ "$V821" == "true" ]] && arr+=('"v821b_aic8800d80"')
+          [[ "$V821"   == "true" ]] && arr+=('"v821b_aic8800d80"')
+          [[ "$AX520"  == "true" ]] && arr+=('"ax520_aic8800d80"')
+          [[ "$IMX6UL" == "true" ]] && arr+=('"imx6ul_iw416"')
+          [[ "$IMX6UL_RTL8822CS" == "true" ]] && arr+=('"imx6ul_rtl8822cs"')
+          [[ "$IMX6UL_RTL8822BS" == "true" ]] && arr+=('"imx6ul_rtl8822bs"')
           {
             printf 'matrix={"target":[%s]}\n' "$(IFS=,; echo "${arr[*]}")"
             printf 'any=%s\n' "$(IFS=,; echo "${arr[*]}")"
@@ -132,34 +152,6 @@ jobs:
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           "$HOME/.cargo/bin/rustc" --version
 
-      - name: Install armv7 cross toolchain
-        if: matrix.target == 'cpc200-ccpa'
-        shell: bash
-        run: |
-          set -euo pipefail
-          apt-get install -y --no-install-recommends gcc-arm-linux-gnueabihf libc6-dev-armhf-cross
-          "$HOME/.cargo/bin/rustup" target add armv7-unknown-linux-gnueabihf
-          arm-linux-gnueabihf-gcc --version | head -1
-
-      - name: Cache cargo (cpc200-ccpa)
-        if: matrix.target == 'cpc200-ccpa'
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            native/livi-helperd/target
-          key: cargo-livi-link-armv7-${{ hashFiles('native/livi-helperd/**/Cargo.toml') }}
-          restore-keys: cargo-livi-link-armv7-
-
-      - name: Build cpc200-ccpa asset
-        if: matrix.target == 'cpc200-ccpa'
-        shell: bash
-        run: |
-          set -euo pipefail
-          chmod +x scripts/livi-link/build-armv7.sh
-          scripts/livi-link/build-armv7.sh "assets/livi-link/${{ matrix.target }}"
-
       - name: Install Andes riscv32 cross toolchain
         if: matrix.target == 'v821b_aic8800d80'
         shell: bash
@@ -177,13 +169,14 @@ jobs:
           echo "TC_BIN=$TC_BIN" >> "$GITHUB_ENV"
           echo "$TC_BIN" >> "$GITHUB_PATH"
 
-      - name: Install userspace build deps
+      # The riscv64 gcc builds the rv32 kernel, the Andes gcc the userspace and livid.
+      - name: Install v821b build deps
         if: matrix.target == 'v821b_aic8800d80'
         shell: bash
         run: |
           set -euo pipefail
           apt-get install -y --no-install-recommends \
-            bc bison flex libssl-dev libelf-dev cmake pkg-config \
+            gcc-riscv64-linux-gnu bc bison flex libssl-dev libelf-dev bzip2 cmake pkg-config \
             squashfs-tools
 
       - name: Setup Rust nightly + rust-src (v821b)
@@ -209,28 +202,68 @@ jobs:
         if: matrix.target == 'v821b_aic8800d80'
         shell: bash
         env:
-          TOP: ${{ github.workspace }}/build/tina-test
-          BUILD: ${{ github.workspace }}/build/livi-userspace-build
-          OUT_DIR: ${{ github.workspace }}/build/tina-test/out
-          USERSPACE: ${{ github.workspace }}/build/livi-userspace-build/out
-          KERNEL_SRC: ${{ github.workspace }}/build/tina-test/tina-v821-v1.3-kernel/linux-5.4-ansc
+          BOARD_DIR: scripts/livi-link/riscv/v821b
+          TOP: ${{ github.workspace }}/build/${{ matrix.target }}
         run: |
           set -euo pipefail
-          mkdir -p "$TOP" "$BUILD" "$OUT_DIR"
-          chmod +x scripts/livi-link/*.sh
+          mkdir -p "$TOP"
+          bash "$BOARD_DIR/build-userspace.sh"
+          bash "$BOARD_DIR/build-mainline.sh"
+          bash scripts/livi-link/common/build-rootfs.sh "$BOARD_DIR"
+          bash scripts/livi-link/common/pack-bundle.sh "$BOARD_DIR"
 
-          scripts/livi-link/build-v821b.sh
-          scripts/livi-link/build-userspace.sh
-          scripts/livi-link/build-mtd3.sh
-
-          # build-mtd3.sh triggers pack-bundle.sh via its own hook.
-          ls -la "$OUT_DIR"/*.lfwb "$OUT_DIR"/livi-link-v821b-mtd*.bin
-
-          # Stage the .lfwb as the artifact payload for this matrix cell.
+          BUNDLE=$(source "$BOARD_DIR/board.sh" && echo "$BUNDLE")
           mkdir -p "assets/livi-link/${{ matrix.target }}"
-          cp "$OUT_DIR/livi-link-v821b.lfwb" "assets/livi-link/${{ matrix.target }}/"
+          cp "$BUNDLE" "assets/livi-link/${{ matrix.target }}/"
           source scripts/livi-link/version.sh
-          livi_firmware_json "assets/livi-link/${{ matrix.target }}/livi-link-v821b.lfwb"
+          livi_firmware_json "assets/livi-link/${{ matrix.target }}/$(basename "$BUNDLE")"
+
+      # Every armv7 board builds the same way, only its directory under scripts/livi-link/arm differs.
+      - name: Install arm-linux-gnueabihf cross toolchain (armv7)
+        if: matrix.target == 'ax520_aic8800d80' || startsWith(matrix.target, 'imx6ul_')
+        shell: bash
+        run: |
+          set -euo pipefail
+          apt-get install -y --no-install-recommends \
+            gcc-arm-linux-gnueabihf squashfs-tools \
+            bc bison flex libssl-dev libelf-dev bzip2 pkg-config
+          "$HOME/.cargo/bin/rustup" target add armv7-unknown-linux-musleabihf
+          arm-linux-gnueabihf-gcc --version | head -1
+
+      - name: Cache cargo (armv7)
+        if: matrix.target == 'ax520_aic8800d80' || startsWith(matrix.target, 'imx6ul_')
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            native/livi-helperd/target
+          key: cargo-livi-link-${{ matrix.target }}-${{ hashFiles('native/livi-helperd/**/Cargo.toml') }}
+          restore-keys: cargo-livi-link-${{ matrix.target }}-
+
+      - name: Build armv7 firmware bundle
+        if: matrix.target == 'ax520_aic8800d80' || startsWith(matrix.target, 'imx6ul_')
+        shell: bash
+        env:
+          BOARD_DIR: scripts/livi-link/arm/${{ matrix.target == 'ax520_aic8800d80' && 'ax520' || 'imx6ul' }}
+          TARGET: ${{ matrix.target }}
+          TOP: ${{ github.workspace }}/build/${{ matrix.target }}
+          CROSS_COMPILE: arm-linux-gnueabihf-
+        run: |
+          set -euo pipefail
+          # An i.MX6UL target names the Wi-Fi/Bluetooth module its build is for.
+          if [[ $TARGET == imx6ul_* ]]; then export RADIO=${TARGET#imx6ul_}; fi
+          mkdir -p "$TOP"
+          bash scripts/livi-link/arm/build-userspace.sh "$BOARD_DIR"
+          bash "$BOARD_DIR/build.sh"
+          bash scripts/livi-link/common/build-rootfs.sh "$BOARD_DIR"
+          bash scripts/livi-link/common/pack-bundle.sh "$BOARD_DIR"
+
+          BUNDLE=$(source "$BOARD_DIR/board.sh" && echo "$BUNDLE")
+          mkdir -p "assets/livi-link/${{ matrix.target }}"
+          cp "$BUNDLE" "assets/livi-link/${{ matrix.target }}/"
+          source scripts/livi-link/version.sh
+          livi_firmware_json "assets/livi-link/${{ matrix.target }}/$(basename "$BUNDLE")"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v6
@@ -248,19 +281,40 @@ jobs:
         with:
           ref: ${{ github.ref }}
 
-      - name: Download cpc200-ccpa artifact
-        if: contains(needs.targets.outputs.any, 'cpc200-ccpa')
-        uses: actions/download-artifact@v8
-        with:
-          name: cpc200-ccpa
-          path: assets/livi-link/cpc200-ccpa
-
       - name: Download v821b_aic8800d80 artifact
         if: contains(needs.targets.outputs.any, 'v821b_aic8800d80')
         uses: actions/download-artifact@v8
         with:
           name: v821b_aic8800d80
           path: assets/livi-link/v821b_aic8800d80
+
+      - name: Download ax520_aic8800d80 artifact
+        if: contains(needs.targets.outputs.any, 'ax520_aic8800d80')
+        uses: actions/download-artifact@v8
+        with:
+          name: ax520_aic8800d80
+          path: assets/livi-link/ax520_aic8800d80
+
+      - name: Download imx6ul_iw416 artifact
+        if: contains(needs.targets.outputs.any, 'imx6ul_iw416')
+        uses: actions/download-artifact@v8
+        with:
+          name: imx6ul_iw416
+          path: assets/livi-link/imx6ul_iw416
+
+      - name: Download imx6ul_rtl8822cs artifact
+        if: contains(needs.targets.outputs.any, 'imx6ul_rtl8822cs')
+        uses: actions/download-artifact@v8
+        with:
+          name: imx6ul_rtl8822cs
+          path: assets/livi-link/imx6ul_rtl8822cs
+
+      - name: Download imx6ul_rtl8822bs artifact
+        if: contains(needs.targets.outputs.any, 'imx6ul_rtl8822bs')
+        uses: actions/download-artifact@v8
+        with:
+          name: imx6ul_rtl8822bs
+          path: assets/livi-link/imx6ul_rtl8822bs
 
       - name: Commit and push
         shell: bash
@@ -276,9 +330,7 @@ jobs:
           fi
 
           # The target dirs that changed in this run, names only, comma-separated
-          # (e.g. "cpc200-ccpa, v821b_aic8800d80"). Both binaries share the Rust crates,
-          # so a change there legitimately restages both — and v821b_aic8800d80 carries no
-          # MANIFEST.md5, so this reads the staged diff rather than scanning for manifests.
+          # (e.g. "imx6ul_iw416, v821b_aic8800d80"), read from the staged diff.
           details="$(git diff --cached --name-only -- assets/livi-link \
             | sed -n 's#^assets/livi-link/\([^/]*\)/.*#\1#p' | sort -u \
             | paste -sd, - | sed 's/,/, /g')"
@@ -306,19 +358,12 @@ jobs:
           - name: macos-arm64
             runner: macos-latest
           - name: linux-x64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
           - name: linux-arm64
             runner: ubuntu-24.04-arm
 
     steps:
       - uses: actions/checkout@v6
-
-      - name: Take the cpc200-ccpa binary from this run
-        if: contains(needs.targets.outputs.any, 'cpc200-ccpa')
-        uses: actions/download-artifact@v8
-        with:
-          name: cpc200-ccpa
-          path: assets/livi-link/cpc200-ccpa
 
       - name: Take the v821b firmware bundle from this run
         if: contains(needs.targets.outputs.any, 'v821b_aic8800d80')
@@ -326,6 +371,34 @@ jobs:
         with:
           name: v821b_aic8800d80
           path: assets/livi-link/v821b_aic8800d80
+
+      - name: Take the ax520 firmware bundle from this run
+        if: contains(needs.targets.outputs.any, 'ax520_aic8800d80')
+        uses: actions/download-artifact@v8
+        with:
+          name: ax520_aic8800d80
+          path: assets/livi-link/ax520_aic8800d80
+
+      - name: Take the imx6ul_iw416 firmware bundle from this run
+        if: contains(needs.targets.outputs.any, 'imx6ul_iw416')
+        uses: actions/download-artifact@v8
+        with:
+          name: imx6ul_iw416
+          path: assets/livi-link/imx6ul_iw416
+
+      - name: Take the imx6ul_rtl8822cs firmware bundle from this run
+        if: contains(needs.targets.outputs.any, 'imx6ul_rtl8822cs')
+        uses: actions/download-artifact@v8
+        with:
+          name: imx6ul_rtl8822cs
+          path: assets/livi-link/imx6ul_rtl8822cs
+
+      - name: Take the imx6ul_rtl8822bs firmware bundle from this run
+        if: contains(needs.targets.outputs.any, 'imx6ul_rtl8822bs')
+        uses: actions/download-artifact@v8
+        with:
+          name: imx6ul_rtl8822bs
+          path: assets/livi-link/imx6ul_rtl8822bs
 
       - name: Setup Rust
         shell: bash

@@ -2,23 +2,32 @@
 pub fn run(_args: Vec<String>) -> i32 {
     match livid_main() {
         Ok(()) => 0,
-        Err(e) => { eprintln!("[livi-ledd] {e}"); 1 }
+        Err(e) => {
+            eprintln!("[livi-ledd] {e}");
+            1
+        }
     }
 }
 
-// livi-ledd — single-pixel RGB LED driver for the LIVI-Link (V821B) dongle.
+// livi-ledd — LED driver for the LIVI-Link dongles.
 //
-// Drives a WS2812-style chip via /dev/spidev1.0 (3-bit-per-bit encoding at
-// ~2.4 MHz). State inputs are file existence under /tmp/livi/led/. Config
-// (WLAN color + brightness) lives in /etc/livi/led.toml.
+// Drives WS2812-style chips via /dev/spidev1.0 (4-bit-per-bit encoding at
+// ~3.1 MHz). One pixel on V821B, a chain of three on AX520 (the count comes from the
+// board's device tree). A board without a pixel (i.MX6UL) has a red status LED and a blue
+// one under /sys/class/leds instead. State inputs are file existence under /tmp/livi/led/
+// and the radio switches in /tmp/livi/radio.conf.
+// Config (WLAN color + brightness) lives in /etc/livi/led.toml.
 //
 // Wifi and bluetooth share the one pixel the way two LEDs would, their colours added:
 //   wifi client     → wlan-color solid   (a station is associated to the AP)
 //   waiting         → wlan-color blinking (no client on the AP yet)
 //   bt-connected    → blue solid, on top of the wifi state
 //   bt-paging       → pulsing blue, over the wifi state
+//   switched off    → that radio's part stays dark
 // Ahead of both:
-//   flash-mode      → red+blue alternating (~2 Hz)
+//   flash-error     → red solid, a write or its check failed: do not unplug, do not reboot into it
+//   flash-mode      → red+blue alternating (~2 Hz), a partition is being written
+//   flash-done      → green solid, everything is written and verified: safe to unplug or reboot
 //   iap2-active     → off
 //
 // Brightness = 0 turns the LED off entirely (no separate toggle needed).
@@ -31,7 +40,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use livi_wifi::radio::{self, Radio};
+
 const SPI_DEV: &str = "/dev/spidev1.0";
+const LEDS_DIR: &str = "/sys/class/leds";
+// Chain length, a big-endian u32 on the spidev node. Boards without the property have one LED.
+const LED_COUNT_PROP: &str = "/sys/bus/spi/devices/spi1.0/of_node/livi,led-count";
 // /etc/ is on read-only squashfs; the runtime config lives on tmpfs.
 // rcS seeds it from /etc/livi/led.toml at boot; changes made via the web
 // UI are lost on reboot until we add a writable partition.
@@ -77,35 +91,43 @@ struct Config {
 impl Default for Config {
     fn default() -> Self {
         // Matches the "● online" accent (--acc: #4dd0e1) in the web UI.
-        Self {
-            status: Rgb(0x4d, 0xd0, 0xe1),
-            brightness_pct: 20,
-            wb: Rgb(255, 190, 130),
-        }
+        Self { status: Rgb(0x4d, 0xd0, 0xe1), brightness_pct: 20, wb: Rgb(255, 190, 130) }
     }
 }
 
 impl Config {
     fn load() -> Self {
-        let Ok(s) = fs::read_to_string(CONFIG_PATH) else { return Self::default(); };
+        let Ok(s) = fs::read_to_string(CONFIG_PATH) else {
+            return Self::default();
+        };
         let mut cfg = Self::default();
         for line in s.lines() {
             let line = line.trim();
             // Only whole-line comments — a `#` mid-value belongs to the value
             // (e.g. status_color = "#00ff00" — else we'd chop the colour).
-            if line.is_empty() || line.starts_with('#') { continue; }
-            let Some((k, v)) = line.split_once('=') else { continue; };
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((k, v)) = line.split_once('=') else {
+                continue;
+            };
             let k = k.trim();
             let v = v.trim().trim_matches('"');
             match k {
                 "status_color" => {
-                    if let Some(rgb) = parse_rgb(v) { cfg.status = rgb; }
+                    if let Some(rgb) = parse_rgb(v) {
+                        cfg.status = rgb;
+                    }
                 }
                 "brightness" => {
-                    if let Ok(n) = v.parse::<u8>() { cfg.brightness_pct = n.min(100); }
+                    if let Ok(n) = v.parse::<u8>() {
+                        cfg.brightness_pct = n.min(100);
+                    }
                 }
                 "white_balance" => {
-                    if let Some(rgb) = parse_rgb(v) { cfg.wb = rgb; }
+                    if let Some(rgb) = parse_rgb(v) {
+                        cfg.wb = rgb;
+                    }
                 }
                 _ => {}
             }
@@ -117,28 +139,73 @@ impl Config {
 fn parse_rgb(s: &str) -> Option<Rgb> {
     // Accept "r,g,b" or "#rrggbb"
     if let Some(hex) = s.strip_prefix('#') {
-        if hex.len() != 6 { return None; }
+        if hex.len() != 6 {
+            return None;
+        }
         let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
         let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
         let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
         return Some(Rgb(r, g, b));
     }
     let parts: Vec<_> = s.split(',').map(|p| p.trim()).collect();
-    if parts.len() != 3 { return None; }
+    if parts.len() != 3 {
+        return None;
+    }
     Some(Rgb(parts[0].parse().ok()?, parts[1].parse().ok()?, parts[2].parse().ok()?))
 }
 
 // ---------------------------------------------------------------------------
-// State (from /tmp/livi/led/*)
+// State (from /tmp/livi/led/* and the radio switches)
 // ---------------------------------------------------------------------------
+
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+enum Wifi {
+    Off,
+    #[default]
+    Waiting,
+    Client,
+}
+
+impl Wifi {
+    fn of(switched_on: bool, client: bool) -> Self {
+        match (switched_on, client) {
+            (false, _) => Self::Off,
+            (true, true) => Self::Client,
+            (true, false) => Self::Waiting,
+        }
+    }
+}
+
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+enum Bt {
+    Off,
+    #[default]
+    Idle,
+    Paging,
+    Connected,
+}
+
+impl Bt {
+    // The switch goes first: Bluetooth switched off mid-page or mid-connection can leave
+    // bt-paging or bt-connected behind.
+    fn of(switched_on: bool, connected: bool, paging: bool) -> Self {
+        match (switched_on, connected, paging) {
+            (false, _, _) => Self::Off,
+            (true, true, _) => Self::Connected,
+            (true, false, true) => Self::Paging,
+            (true, false, false) => Self::Idle,
+        }
+    }
+}
 
 #[derive(Default, Clone, Copy)]
 struct State {
-    client: bool,
-    bt_paging: bool,
-    bt_connected: bool,
+    wifi: Wifi,
+    bt: Bt,
     iap2_active: bool,
     flash_mode: bool,
+    flash_done: bool,
+    flash_error: bool,
     // `touch /tmp/livi/led/wbtest` forces full white so all three channels light at once —
     // the only way to eyeball the white balance. `rm` it to return to normal.
     wbtest: bool,
@@ -147,12 +214,13 @@ struct State {
 impl State {
     fn read() -> Self {
         Self {
-            client:       wifi_client(),
-            bt_paging:    exists("bt-paging"),
-            bt_connected: exists("bt-connected"),
-            iap2_active:  exists("iap2-active"),
-            flash_mode:   exists("flash-mode"),
-            wbtest:       exists("wbtest"),
+            wifi: Wifi::of(radio::enabled(Radio::Wifi), wifi_client()),
+            bt: Bt::of(radio::enabled(Radio::Bt), exists("bt-connected"), exists("bt-paging")),
+            iap2_active: exists("iap2-active"),
+            flash_mode: exists("flash-mode"),
+            flash_done: exists("flash-done"),
+            flash_error: exists("flash-error"),
+            wbtest: exists("wbtest"),
         }
     }
 }
@@ -175,10 +243,7 @@ fn wifi_client() -> bool {
         return false;
     };
     // 16-byte entries: mac[6], port_no @6, is_local @7. A non-local mac on wlan0's port = a station.
-    fdb.as_chunks::<16>()
-        .0
-        .iter()
-        .any(|e| e[6] == port_no && e[7] == 0)
+    fdb.as_chunks::<16>().0.iter().any(|e| e[6] == port_no && e[7] == 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -188,12 +253,16 @@ fn wifi_client() -> bool {
 #[derive(Clone, Copy)]
 struct Rgb(u8, u8, u8);
 const OFF: Rgb = Rgb(0, 0, 0);
+const RED: Rgb = Rgb(255, 0, 0);
+const GREEN: Rgb = Rgb(0, 255, 0);
 const BLUE: Rgb = Rgb(0, 0, 255);
 
 const WHITE: Rgb = Rgb(255, 255, 255);
 
 fn render(state: &State, cfg: &Config, tick: u64) -> Rgb {
-    if cfg.brightness_pct == 0 { return OFF; }
+    if cfg.brightness_pct == 0 {
+        return OFF;
+    }
 
     // WB test: full white, so brightness + white-balance are the only things shaping it.
     if state.wbtest {
@@ -201,32 +270,76 @@ fn render(state: &State, cfg: &Config, tick: u64) -> Rgb {
         return balance(scale(WHITE, gain), cfg.wb);
     }
 
-    // 2 Hz blink for red/blue flash-mode and for wlan-not-up.
-    let slow_on = (tick / (TICK_HZ / 4)).is_multiple_of(2); // TICK_HZ/4 = 12 → ~2 Hz
-    // Fast blitz (bt-paging): 5 Hz, on ~80 ms so the blue pulse reads as a blink, not a flicker.
-    let blitz_on = (tick % (TICK_HZ / 5)) < (TICK_HZ / 12);
+    let (slow_on, blitz_on) = (slow_on(tick), blitz_on(tick));
 
-    // Steady once a station is on the AP, blinking while it waits for one.
-    let wifi = if state.client || slow_on { cfg.status } else { OFF };
+    let wifi = if wifi_lit(state.wifi, slow_on) { cfg.status } else { OFF };
 
-    let base = if state.flash_mode {
+    let base = if state.flash_error {
+        RED
+    } else if state.flash_mode {
         // Alternating red / blue every ~250 ms
-        if slow_on { Rgb(255, 0, 0) } else { BLUE }
+        if slow_on { RED } else { BLUE }
+    } else if state.flash_done {
+        GREEN
     } else if state.iap2_active {
         OFF
-    } else if state.bt_connected {
-        add(wifi, BLUE)
-    } else if state.bt_paging {
-        // The pulse replaces the colour rather than adding to it: a status colour with
-        // blue in it would swallow an added pulse.
-        if blitz_on { BLUE } else { wifi }
     } else {
-        wifi
+        match state.bt {
+            Bt::Connected => add(wifi, BLUE),
+            // The pulse replaces the colour rather than adding to it: a status colour with
+            // blue in it would swallow an added pulse.
+            Bt::Paging if blitz_on => BLUE,
+            Bt::Paging | Bt::Idle | Bt::Off => wifi,
+        }
     };
 
     // Convert 0-100 % to a u8 gain factor (0-255) for scale().
     let gain = ((cfg.brightness_pct as u16 * 255) / 100) as u8;
     balance(scale(base, gain), cfg.wb)
+}
+
+/// The same states on two plain LEDs, as (status, bluetooth).
+fn render_pair(state: &State, cfg: &Config, tick: u64) -> (bool, bool) {
+    let slow = slow_on(tick);
+    if cfg.brightness_pct == 0 {
+        (false, false)
+    } else if state.wbtest {
+        (true, true)
+    } else if state.flash_error {
+        (true, false)
+    } else if state.flash_mode {
+        (slow, !slow)
+    } else if state.flash_done {
+        (true, true)
+    } else if state.iap2_active {
+        (false, false)
+    } else {
+        let bt = match state.bt {
+            Bt::Connected => true,
+            Bt::Paging => blitz_on(tick),
+            Bt::Idle | Bt::Off => false,
+        };
+        (wifi_lit(state.wifi, slow), bt)
+    }
+}
+
+/// Steady once a station is on the AP, blinking while it waits for one.
+fn wifi_lit(wifi: Wifi, blink_on: bool) -> bool {
+    match wifi {
+        Wifi::Client => true,
+        Wifi::Waiting => blink_on,
+        Wifi::Off => false,
+    }
+}
+
+/// 2 Hz, for the red/blue flash-mode and for wlan-not-up.
+fn slow_on(tick: u64) -> bool {
+    (tick / (TICK_HZ / 4)).is_multiple_of(2) // TICK_HZ/4 = 12 → ~2 Hz
+}
+
+/// Fast blitz (bt-paging): 5 Hz, on ~80 ms so the blue pulse reads as a blink, not a flicker.
+fn blitz_on(tick: u64) -> bool {
+    (tick % (TICK_HZ / 5)) < (TICK_HZ / 12)
 }
 
 fn add(a: Rgb, b: Rgb) -> Rgb {
@@ -266,20 +379,31 @@ fn encode_byte(b: u8, out: &mut [u8; 4]) {
     }
     out[0] = ((acc >> 24) & 0xff) as u8;
     out[1] = ((acc >> 16) & 0xff) as u8;
-    out[2] = ((acc >>  8) & 0xff) as u8;
-    out[3] = ( acc        & 0xff) as u8;
+    out[2] = ((acc >> 8) & 0xff) as u8;
+    out[3] = (acc & 0xff) as u8;
 }
 
 /// Encode one pixel (GRB) into 12 SPI bytes. WS2812B native byte order.
 fn encode_pixel(c: Rgb, out: &mut [u8; 12]) {
     let mut tmp = [0u8; 4];
-    encode_byte(c.1, &mut tmp); out[0..4].copy_from_slice(&tmp);  // G
-    encode_byte(c.0, &mut tmp); out[4..8].copy_from_slice(&tmp);  // R
-    encode_byte(c.2, &mut tmp); out[8..12].copy_from_slice(&tmp); // B
+    encode_byte(c.1, &mut tmp);
+    out[0..4].copy_from_slice(&tmp); // G
+    encode_byte(c.0, &mut tmp);
+    out[4..8].copy_from_slice(&tmp); // R
+    encode_byte(c.2, &mut tmp);
+    out[8..12].copy_from_slice(&tmp); // B
+}
+
+fn led_count() -> usize {
+    fs::read(LED_COUNT_PROP)
+        .ok()
+        .and_then(|b| <[u8; 4]>::try_from(b.as_slice()).ok())
+        .map_or(1, |b| u32::from_be_bytes(b).clamp(1, 16) as usize)
 }
 
 struct Spi {
     file: fs::File,
+    leds: usize,
 }
 
 impl Spi {
@@ -295,11 +419,11 @@ impl Spi {
             let hz: u32 = SPI_HZ;
             check(libc::ioctl(fd, SPI_IOC_WR_MAX_SPEED_HZ as _, &hz as *const u32))?;
         }
-        Ok(Self { file })
+        Ok(Self { file, leds: led_count() })
     }
 
     fn write_pixel(&mut self, c: Rgb) -> std::io::Result<()> {
-        // [25 leading zeros | 12 data | 25 trailing zeros]
+        // [25 leading zeros | 12 data per LED, all the same colour | 25 trailing zeros]
         // 25 bytes at 3.2 MHz = ~62 µs low — more than the WS2812 reset
         // threshold (≥50 µs). The LEADING gap forces the chip into a
         // clean reset-done state right before our data (killing any
@@ -307,10 +431,12 @@ impl Spi {
         // stretch the first bit's high pulse and light G at 128); the
         // TRAILING gap latches the pixel and survives whatever the SPI
         // hardware does with MOSI while CS is deasserted.
-        let mut buf = [0u8; 25 + 12 + 25];
+        let mut buf = vec![0u8; 25 + 12 * self.leds + 25];
         let mut px = [0u8; 12];
         encode_pixel(c, &mut px);
-        buf[25..37].copy_from_slice(&px);
+        for led in buf[25..25 + 12 * self.leds].as_chunks_mut::<12>().0 {
+            *led = px;
+        }
         self.file.write_all(&buf)?;
         Ok(())
     }
@@ -318,6 +444,63 @@ impl Spi {
 
 fn check(rc: libc::c_int) -> std::io::Result<()> {
     if rc < 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) }
+}
+
+/// A plain LED, switched through its brightness file.
+struct Led {
+    path: String,
+    on: Option<bool>,
+}
+
+impl Led {
+    fn open(name: &str) -> Option<Self> {
+        let path = format!("{LEDS_DIR}/{name}/brightness");
+        Path::new(&path).exists().then_some(Self { path, on: None })
+    }
+
+    fn set(&mut self, on: bool) {
+        if self.on != Some(on) && fs::write(&self.path, if on { "1" } else { "0" }).is_ok() {
+            self.on = Some(on);
+        }
+    }
+}
+
+enum Leds {
+    Pixel(Spi),
+    /// The red status LED and the blue one.
+    Pair(Led, Led),
+}
+
+impl Leds {
+    fn open() -> std::io::Result<Self> {
+        match Spi::open() {
+            Ok(spi) => Ok(Self::Pixel(spi)),
+            Err(e) => match (Led::open("red"), Led::open("blue")) {
+                (Some(status), Some(bt)) => Ok(Self::Pair(status, bt)),
+                _ => Err(std::io::Error::new(
+                    e.kind(),
+                    format!("open {SPI_DEV}: {e}, and there is no red and blue LED either"),
+                )),
+            },
+        }
+    }
+
+    fn show(&mut self, state: &State, cfg: &Config, tick: u64) {
+        match self {
+            // Rewrite every tick, even if the colour is unchanged: this
+            // continuously re-affirms the pixel state so a single missed
+            // latch or a stray transient cannot leave the LED stuck in a
+            // stale colour.
+            Self::Pixel(spi) => {
+                let _ = spi.write_pixel(render(state, cfg, tick));
+            }
+            Self::Pair(status, bt) => {
+                let (s, b) = render_pair(state, cfg, tick);
+                status.set(s);
+                bt.set(b);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -338,17 +521,11 @@ fn livid_main() -> std::io::Result<()> {
     let _ = fs::write(PID_PATH, format!("{}\n", std::process::id()));
 
     unsafe {
-        libc::signal(libc::SIGHUP,  on_sighup as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGHUP, on_sighup as *const () as libc::sighandler_t);
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
 
-    let mut spi = match Spi::open() {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("[livi-ledd] open {SPI_DEV}: {e}");
-            return Err(e);
-        }
-    };
+    let mut leds = Leds::open()?;
 
     let mut cfg = Config::load();
     let mut cfg_mtime = mtime(CONFIG_PATH);
@@ -364,14 +541,7 @@ fn livid_main() -> std::io::Result<()> {
             cfg = Config::load();
         }
 
-        let state = State::read();
-        let want = render(&state, &cfg, tick);
-
-        // Rewrite every tick, even if the colour is unchanged: this
-        // continuously re-affirms the pixel state so a single missed
-        // latch or a stray transient cannot leave the LED stuck in a
-        // stale colour.
-        let _ = spi.write_pixel(want);
+        leds.show(&State::read(), &cfg, tick);
 
         let start = Instant::now();
         thread::sleep(TICK.saturating_sub(start.elapsed()));
@@ -388,3 +558,86 @@ fn mtime(path: &str) -> u64 {
         .unwrap_or(0)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pair(state: State, tick: u64) -> (bool, bool) {
+        render_pair(&state, &Config::default(), tick)
+    }
+
+    fn pixel(state: State, tick: u64) -> (u8, u8, u8) {
+        let c = render(&state, &Config::default(), tick);
+        (c.0, c.1, c.2)
+    }
+
+    fn over_a_second(state: State, led: fn((bool, bool)) -> bool) -> Vec<bool> {
+        (0..TICK_HZ).map(|t| led(pair(state, t))).collect()
+    }
+
+    fn with(wifi: Wifi, bt: Bt) -> State {
+        State { wifi, bt, ..Default::default() }
+    }
+
+    #[test]
+    fn two_leds_show_wifi_on_red_and_bluetooth_on_blue() {
+        let waiting = over_a_second(State::default(), |p| p.0);
+        assert!(waiting.contains(&true) && waiting.contains(&false));
+        assert_eq!(pair(with(Wifi::Client, Bt::Idle), 13), (true, false));
+        assert_eq!(pair(with(Wifi::Client, Bt::Connected), 13), (true, true));
+        let paging = over_a_second(with(Wifi::Client, Bt::Paging), |p| p.1);
+        assert!(paging.contains(&true) && paging.contains(&false));
+    }
+
+    #[test]
+    fn two_leds_alternate_while_flashing_and_red_stays_on_a_failed_write() {
+        for t in 0..TICK_HZ {
+            let (red, blue) = pair(State { flash_mode: true, ..with(Wifi::Client, Bt::Idle) }, t);
+            assert_ne!(red, blue);
+        }
+        assert_eq!(
+            pair(State { flash_error: true, flash_mode: true, ..Default::default() }, 0),
+            (true, false)
+        );
+    }
+
+    #[test]
+    fn the_switch_goes_ahead_of_what_the_radio_reports() {
+        assert_eq!(Wifi::of(false, true), Wifi::Off);
+        assert_eq!(Wifi::of(true, false), Wifi::Waiting);
+        assert_eq!(Wifi::of(true, true), Wifi::Client);
+        assert_eq!(Bt::of(false, true, true), Bt::Off);
+        assert_eq!(Bt::of(true, true, true), Bt::Connected);
+        assert_eq!(Bt::of(true, false, true), Bt::Paging);
+        assert_eq!(Bt::of(true, false, false), Bt::Idle);
+    }
+
+    #[test]
+    fn a_switched_off_radio_stays_dark() {
+        let wifi_off = with(Wifi::Off, Bt::Idle);
+        assert!((0..TICK_HZ).all(|t| pixel(wifi_off, t) == (0, 0, 0) && !pair(wifi_off, t).0));
+
+        let bt_off = with(Wifi::Client, Bt::Off);
+        assert_eq!(pixel(bt_off, 13), pixel(with(Wifi::Client, Bt::Idle), 13));
+        assert_eq!(pair(bt_off, 13), (true, false));
+
+        let both_off = with(Wifi::Off, Bt::Off);
+        assert!(
+            (0..TICK_HZ)
+                .all(|t| pixel(both_off, t) == (0, 0, 0) && pair(both_off, t) == (false, false))
+        );
+    }
+
+    #[test]
+    fn a_failed_write_shows_with_both_radios_off() {
+        let failed = State { flash_error: true, ..with(Wifi::Off, Bt::Off) };
+        assert_ne!(pixel(failed, 0).0, 0);
+        assert_eq!(pair(failed, 0), (true, false));
+    }
+
+    #[test]
+    fn brightness_zero_turns_both_off() {
+        let cfg = Config { brightness_pct: 0, ..Config::default() };
+        assert_eq!(render_pair(&with(Wifi::Client, Bt::Connected), &cfg, 0), (false, false));
+    }
+}

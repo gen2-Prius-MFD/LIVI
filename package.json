@@ -1,6 +1,6 @@
 {
   "name": "LIVI",
-  "version": "9.0.0",
+  "version": "9.1.0",
   "description": "LIVI - Linux In-Vehicle Infotainment",
   "desktopName": "dev.f-io.livi.desktop",
   "main": "./out/main/main.js",
@@ -11,7 +11,7 @@
   ],
   "homepage": "https://f-io.dev",
   "license": "GPL-3.0-or-later",
-  "packageManager": "pnpm@12.6.0",
+  "packageManager": "pnpm@12.8.1",
   "scripts": {
     "prepare": "husky",
     "dev": "vite",
@@ -44,7 +44,8 @@
     "coverage:renderer": "vitest run --project renderer --coverage --coverage.reportsDirectory=coverage/renderer --coverage.include='src/renderer/**/*.{ts,tsx}'"
   },
   "lint-staged": {
-    "*.{js,jsx,cjs,mjs,ts,tsx,cts,mts,json,jsonc,css,scss,md,yml,yaml}": "biome check --write --no-errors-on-unmatched"
+    "*.{js,jsx,cjs,mjs,ts,tsx,cts,mts,json,jsonc,css,scss,md,yml,yaml}": "biome check --write --no-errors-on-unmatched",
+    "*.rs": "rustfmt"
   },
   "dependencies": {
     "@base-ui/react": "^1.8.0",
@@ -60,30 +61,30 @@
     "protobufjs": "^8.8.0",
     "react-i18next": "^17.0.15",
     "react-router": "^8.4.0",
-    "socket.io": "^4.8.3",
+    "socket.io": "^4.8.4",
     "zustand": "^5.0.15"
   },
   "devDependencies": {
-    "@biomejs/biome": "^2.5.14",
+    "@biomejs/biome": "^2.5.15",
     "@testing-library/jest-dom": "^7.0.1",
     "@testing-library/react": "^16.3.3",
-    "@types/node": "^26.6.2",
+    "@types/node": "^26.6.3",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
     "@vitejs/plugin-react": "^6.1.1",
-    "@vitest/coverage-v8": "^5.0.1",
-    "electron": "^44.4.5",
+    "@vitest/coverage-v8": "^5.0.3",
+    "electron": "^44.5.1",
     "electron-builder": "^26.15.3",
     "esbuild": "^0.28.2",
     "globals": "^17.12.0",
     "husky": "^9.1.7",
     "jsdom": "^30.1.1",
-    "lint-staged": "^17.5.1",
+    "lint-staged": "^17.6.0",
     "react": "^19.3.0",
     "react-dom": "^19.3.0",
     "typescript": "^7.0.2",
-    "vite": "^8.3.0",
+    "vite": "^8.3.1",
     "vite-plugin-electron": "^1.1.2",
-    "vitest": "^5.0.1"
+    "vitest": "^5.0.3"
   }
 }

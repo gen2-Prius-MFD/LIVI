@@ -8,28 +8,49 @@ supported on Linux and macOS, and can provide:
 - **Bluetooth** as a vhci on Linux and on macOS the dongle pairs the phone
 
 Each one is enabled separately in the settings. While the dongle is not selected in the settings,
-LIVI turns its access point temporarly off to keep interference low.
+LIVI turns its access point temporarily off to keep interference low.
+
+## Firmware
+
+Each firmware brings its own Linux kernel. The web interface shows it under **Kernel**.
+
+| Firmware | Kernel |
+| --- | --- |
+| `imx6ul_iw416` | 7.2.8 |
+| `imx6ul_rtl8822cs` | 7.2.8 |
+| `imx6ul_rtl8822bs` | 7.2.8 |
+| `v821b_aic8800d80` | 7.2.8  |
+| `ax520_aic8800d80` | 7.2.8  |
 
 ## Supported hardware
 
-Several bridges are the same board sold under different names. The same product name can also cover different hardware. A row counts as **confirmed** only once someone has sucessfully installed LIVI Link on that product.
+Several bridges are the same board sold under different names, and one name can cover completely
+different hardware. Vendors are known for keeping a product name while the board inside changes,
+sometimes from one month to the next. The Mini Ultra3 alone has come with at least three different
+boards so far, among them one with an Ingenic SoC and one with the Allwinner V821B. So the name on the box says little about what is inside. A
+row counts as **confirmed** only once someone has successfully installed LIVI Link on that product.
 
-| Firmware | Hardware | Sold as | Wi-Fi | State |
-| --- | --- | --- | --- | --- |
-| `cpc200-ccpa` | NXP i.MX6UL, IW416 | CPC200-CCPA | 5 GHz, 40 MHz | confirmed |
-| `cpc200-ccpa` | NXP i.MX6UL, IW416 | CPC200-C2Air | 5 GHz, 40 MHz | not confirmed |
-| none | NXP i.MX6UL, IW416  | CPC200-2Air | | not supported |
-| `v821b_aic8800d80` | Allwinner V821B, AIC8800D80 | Mini Ultra3 | 5 GHz, 80 MHz | confirmed |
-| `v821b_aic8800d80` | Allwinner V821B, AIC8800D80 | CPC200-C2Air | 5 GHz, 80 MHz | not confirmed |
-| none | Axera AX520CE, AIC8800D80 | CPC200-C2Air | | not supported |
+| Firmware | Hardware | Sold as | Wi-Fi | Max PHY rate | State |
+| --- | --- | --- | --- | --- | --- |
+| `imx6ul_iw416`[^vendorfw] | NXP i.MX6UL, IW416 | CPC200-CCPA | Wi-Fi 4, 1x1, 5 GHz, 40 MHz | 150 Mbit/s | confirmed |
+| `imx6ul_rtl8822cs` | NXP i.MX6UL, RTL8822CS | CPC200-CCPA | Wi-Fi 5, 2x2, 5 GHz, 80 MHz | 867 Mbit/s | not confirmed |
+| `imx6ul_rtl8822bs`[^nobt] | NXP i.MX6UL, RTL8822BS | CPC200-Autokit | Wi-Fi 5, 2x2, 5 GHz, 80 MHz | 867 Mbit/s | confirmed |
+| `imx6ul_iw416` | NXP i.MX6UL, IW416 | CPC200-C2Air | Wi-Fi 4, 1x1, 5 GHz, 40 MHz | 150 Mbit/s | not confirmed |
+| `imx6ul_iw416` | NXP i.MX6UL, IW416 | CPC200-2Air | Wi-Fi 4, 1x1, 5 GHz, 40 MHz | 150 Mbit/s | not confirmed |
+| `v821b_aic8800d80` | Allwinner V821B, AIC8800D80 | Mini Ultra3 | Wi-Fi 6, 1x1, 5 GHz, 80 MHz | 600 Mbit/s | confirmed |
+| none | Ingenic X1600E, AIC8800D80 | Mini Ultra1 | Wi-Fi 6, 1x1, 5 GHz, 80 MHz | 600 Mbit/s | not supported |
+| `v821b_aic8800d80` | Allwinner V821B, AIC8800D80 | CPC200-C2Air | Wi-Fi 6, 1x1, 5 GHz, 80 MHz | 600 Mbit/s | not confirmed |
+| `ax520_aic8800d80` | Axera AX520CE, AIC8800D80 | CPC200-C2Air | Wi-Fi 6, 1x1, 5 GHz, 80 MHz | 600 Mbit/s | confirmed[^mfi] |
 
-The provisioning tool probes the dongle before it writes anything, and reports hardware it does not know as not found.
+[^vendorfw]: Tested from the latest vendor firmware. If the install stops with an error, update the
+    dongle to the latest vendor firmware first and try again.
+[^mfi]: MFi authentication needs an MFi chip on the dongle. Without one, LIVI Link provides the
+    access point and Bluetooth only.
+[^nobt]: Wi-Fi only for now, the module's Bluetooth is not supported yet. On macOS, where the
+    dongle pairs the phone, that means no wireless CarPlay.
 
-Two reports say the install fails on a CPC200-CCPA running stock firmware `2025.10.15.1127`,
-where the dongle drops off USB before anything is written, but works after a downgrade to
-`2025.02.25.1521` ([#341](https://github.com/f-io/LIVI/issues/341),
-[#347](https://github.com/f-io/LIVI/issues/347)). We could not reproduce it here. A dongle on the
-latest stock firmware installed fine. If yours drops off USB during the install, a downgrade and try again.
+That is why the provisioning tool probes the dongle before it writes anything, and reports hardware
+it does not know as not found.
 
 ## Setup
 
@@ -50,16 +71,24 @@ xattr -d com.apple.quarantine livi-link-provision
 ```
 
 If the dongle is still on stock firmware, the tool asks you to unplug and replug it once. After
-that it runs on its own: backup, install, reboot, verify. It takes the backup before it changes
-anything and puts it in `~/Library/Application Support/LIVI/dongle-backup/` on macOS, or
+that it runs on its own: it backs up the flash, installs LIVI Link and waits until the dongle
+answers as LIVI Link. A CPC200-CCPA restarts a few times on the way, because its kernel goes in
+first. The backup is taken before anything is written and goes to
+`~/Library/Application Support/LIVI/backup/dongle-backup/` on macOS, or
 `~/.local/share/LIVI/dongle-backup/` on Linux.
 
+Some i.MX6UL dongles offer no network over USB on their vendor firmware. The tool notices that
+after the replug and asks you to join the dongle's own Wi-Fi instead, with the name and password
+the dongle normally uses.
+
+A CPC200-CCPA that got LIVI Link from an earlier release runs it on top of the vendor firmware.
+Its web interface cannot flash the current firmware, please use provisioning tool.
 
 ## Web interface
 
 <http://livi-link.local/>, or <http://10.10.10.1/> over USB. It shows which firmware the dongle
-runs, what the radio is actually doing (channel, width, clients, link rate), Bluetooth, and, if
-the LED supports colours, its colour and brightness.
+runs, the MFi chip it found, what the radio is actually doing (channel, width, clients, link
+rate), Bluetooth, and, if the LED supports colours, its colour and brightness.
 
 <p align="center">
   <img src="docs/media/livi-link/LL.png" width="600" alt="LIVI Link web interface" />
@@ -69,10 +98,12 @@ the LED supports colours, its colour and brightness.
 
 Under **Firmware**, **Check** looks for a newer version and **Update** installs it. With
 **Nightly** on it checks the nightly builds instead of the latest release. The device you have the
-web interface open on needs internet access. While the dongle writes, the LED alternates red and
-blue. Do not unplug it until that stops.
+web interface open on needs internet access. Do not unplug the dongle while it writes. On a dongle
+whose LED shows the states below, red and blue alternate until it is done. A CPC200-CCPA restarts
+twice when an update brings a new kernel.
 
-Every release has the firmware files attached, so you can also upload one by hand.
+Every release has the firmware files attached, so you can also upload one by hand. The
+provisioning tool updates a dongle the same way.
 
 ## LED
 
@@ -91,15 +122,19 @@ If the dongle has an LED, Wi-Fi uses the status LED[^led] and Bluetooth is blue.
 
 ## Getting back to stock
 
-Upload the backup the install made, on the web interface under **Firmware**. The dongle writes it
-and reboots into its original firmware. The LED alternates red and blue while it writes. Do not
-unplug it until that stops.
+With the `v821b_aic8800d80` or `ax520_aic8800d80` firmware, upload the backup the install made
+(`v821b_stock_<date>.lfwb` or `ax520_stock_<date>.lfwb` in the backup folder) on the web interface
+under **Firmware**. The dongle writes it and reboots into its original firmware. Do not unplug it
+while it writes.
+
+With an `imx6ul_…` firmware, run the provisioning tool on the computer
+that did the install and pick **back to the vendor firmware**. It takes the backup it made of this
+dongle, checks that the backup really belongs to it, writes it back from the rescue system and
+restarts into the original firmware. Do not unplug the dongle while it writes.
 
 ## If something goes wrong
 
 If the dongle does not come up on USB or Wi-Fi, give it 30 seconds, then replug it. The logs are under `/tmp` on the dongle.
 
-## Firmware
-
-The firmware carries LIVI's version and the commit it was built from, for example
-`9.0.0 (7850de95)`. The web interface shows both under **Firmware**.
+A CPC200-CCPA whose system does not come up stays in a rescue system after the next restart. It is
+reachable over USB at `10.10.10.1`, and the provisioning tool installs LIVI Link again from there.

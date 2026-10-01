@@ -6,7 +6,7 @@
 //   ATTACH <serial>     -> "OK", after which the connection is the bulk pipe in both directions
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -17,13 +17,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Connects with CONNECT_TIMEOUT rather than the OS default.
 fn connect(addr: &str) -> Result<TcpStream, String> {
-    let sockaddr = addr
-        .to_socket_addrs()
-        .map_err(|e| format!("usbproxy {addr}: {e}"))?
-        .next()
-        .ok_or_else(|| format!("usbproxy {addr}: no address"))?;
-    let s = TcpStream::connect_timeout(&sockaddr, CONNECT_TIMEOUT)
-        .map_err(|e| format!("usbproxy {addr}: {e}"))?;
+    let s =
+        livi_net::connect(addr, CONNECT_TIMEOUT).map_err(|e| format!("usbproxy {addr}: {e}"))?;
     s.set_nodelay(true).ok();
     Ok(s)
 }
@@ -123,7 +118,12 @@ impl MuxReader for TcpReader {
                 buf.truncate(n);
                 Ok(buf)
             }
-            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
                 Ok(Vec::new())
             }
             Err(e) => Err(format!("usbproxy pipe read: {e}")),
@@ -132,10 +132,7 @@ impl MuxReader for TcpReader {
 }
 
 /// Attaches to the phone's bulk endpoints; the socket then carries raw mux bytes.
-pub fn open_pipes(
-    addr: &str,
-    serial: &str,
-) -> Result<MuxPipes, String> {
+pub fn open_pipes(addr: &str, serial: &str) -> Result<MuxPipes, String> {
     let mut s = connect(addr)?;
     s.set_read_timeout(Some(Duration::from_secs(20))).ok();
     s.write_all(format!("ATTACH {serial}\n").as_bytes())
